@@ -1,0 +1,16 @@
+env: ‘cd’: No such file or directory
+nohup: ignoring input
+ZillaPHP — Tiny Shakespeare LM
+==================================================================
+Training chars: 500000   Sequence length: 128
+Epochs: 3   Steps/epoch: 1500   LR: 0.0005
+Batch size: 8
+Model: dim=128  heads=8  layers=4  ffn=512
+Backend: cpu+native
+==================================================================
+
+Vocab size: 63
+Total tokens: 500000
+
+Params: 70 tensors, 825919 numbers
+

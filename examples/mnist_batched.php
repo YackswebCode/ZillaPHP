@@ -30,12 +30,12 @@ $test = new MnistDataset(
 echo "Train: " . $train->size() . " samples\n";
 echo "Test : " . $test->size() . " samples\n\n";
 
-// ---- Config ----
-$TRAIN_N  = (int) ($_ENV['TRAIN_N']  ?? 6000);   // subset for speed
-$TEST_N   = (int) ($_ENV['TEST_N']   ?? 1000);
-$BATCH    = (int) ($_ENV['BATCH']    ?? 32);
-$EPOCHS   = (int) ($_ENV['EPOCHS']   ?? 5);
-$LR       = (float) ($_ENV['LR']     ?? 0.001);
+// ---- Config (reads from env vars, falls back to defaults) ----
+$TRAIN_N  = (int)   (getenv('TRAIN_N')  ?: 6000);
+$TEST_N   = (int)   (getenv('TEST_N')   ?: 1000);
+$BATCH    = (int)   (getenv('BATCH')    ?: 32);
+$EPOCHS   = (int)   (getenv('EPOCHS')   ?: 5);
+$LR       = (float) (getenv('LR')       ?: 0.001);
 
 // ---- Slice dataset ----
 $trainItems = [];
