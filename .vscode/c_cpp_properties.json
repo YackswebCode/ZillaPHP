@@ -9,25 +9,6 @@
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c17",
             "cppStandard": "c++17",
-            "intelliSenseMode": "linux-gcc-x64",
-            "browse": {
-                "path": [
-                    "${workspaceFolder}"
-                ],
-                "limitSymbolsToIncludedHeaders": false,
-                "databaseFilename": ""
-            }
-        },
-        {
-            "name": "CUDA (Colab only)",
-            "includePath": [
-                "${workspaceFolder}/**",
-                "/usr/local/cuda/include"
-            ],
-            "defines": ["__CUDACC__"],
-            "compilerPath": "/usr/local/cuda/bin/nvcc",
-            "cStandard": "c17",
-            "cppStandard": "c++17",
             "intelliSenseMode": "linux-gcc-x64"
         }
     ],
