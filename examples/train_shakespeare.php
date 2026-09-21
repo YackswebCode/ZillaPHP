@@ -23,6 +23,7 @@ $EPOCHS          = (int)   (getenv('EPOCHS')          ?: 1);
 $LR              = (float) (getenv('LR')              ?: 0.003);
 $STEPS_PER_EPOCH = (int)   (getenv('STEPS_PER_EPOCH') ?: 100);
 $LOG_EVERY       = (int)   (getenv('LOG_EVERY')       ?: 20);
+$BATCH           = (int)   (getenv('BATCH')           ?: 1);
 
 // ====================================================================
 // Model configuration
@@ -47,6 +48,7 @@ echo "ZillaPHP — Tiny Shakespeare LM\n";
 echo str_repeat('=', 66) . "\n";
 printf("Training chars: %d   Sequence length: %d\n", $TRAIN_CHARS, $SEQ_LEN);
 printf("Epochs: %d   Steps/epoch: %d   LR: %.4f\n", $EPOCHS, $STEPS_PER_EPOCH, $LR);
+printf("Batch size: %d\n", $BATCH);
 printf("Model: dim=%d  heads=%d  layers=%d  ffn=%d\n", $DIM, $HEADS, $LAYERS, $FFN);
 printf("Backend: %s\n", Tensor::backend()->name());
 echo str_repeat('=', 66) . "\n\n";
@@ -83,19 +85,42 @@ if (!is_dir($ckptDir)) mkdir($ckptDir, 0777, true);
 $startTime   = microtime(true);
 $globalStep  = 0;
 $runningLoss = 0.0;
+$n = count($ids);
 
 for ($epoch = 0; $epoch < $EPOCHS; $epoch++) {
     for ($step = 0; $step < $STEPS_PER_EPOCH; $step++) {
-        $start = mt_rand(0, count($ids) - $SEQ_LEN - 1);
 
-        $inputIds  = array_slice($ids, $start, $SEQ_LEN);
-        $targetIds = array_slice($ids, $start + 1, $SEQ_LEN);
+        if ($BATCH === 1) {
+            // ---- Single-sample path (identical to previous behaviour) ----
+            $start = mt_rand(0, $n - $SEQ_LEN - 1);
+            $inputIds  = array_slice($ids, $start, $SEQ_LEN);
+            $targetIds = array_slice($ids, $start + 1, $SEQ_LEN);
 
-        $input = Tensor::fromArray(array_map('floatval', $inputIds));
+            $input = Tensor::fromArray(array_map('floatval', $inputIds));
 
-        $optimizer->zeroGrad();
-        $logits = $model->forward($input);
-        $l      = $loss->forward($logits, $targetIds);
+            $optimizer->zeroGrad();
+            $logits = $model->forward($input);
+            $l      = $loss->forward($logits, $targetIds);
+        } else {
+            // ---- Batched path ----
+            $inputBatch  = [];
+            $flatTargets = [];
+            for ($b = 0; $b < $BATCH; $b++) {
+                $start = mt_rand(0, $n - $SEQ_LEN - 1);
+                $row   = array_slice($ids, $start, $SEQ_LEN);
+                $inputBatch[] = array_map('floatval', $row);
+
+                $tgtRow = array_slice($ids, $start + 1, $SEQ_LEN);
+                foreach ($tgtRow as $t) $flatTargets[] = $t;
+            }
+
+            $input = Tensor::fromArray($inputBatch);   // [B, T]
+
+            $optimizer->zeroGrad();
+            $logits = $model->forwardBatch($input);    // [B*T, vocab]
+            $l      = $loss->forward($logits, $flatTargets);
+        }
+
         $l->backward();
         $optimizer->step();
 

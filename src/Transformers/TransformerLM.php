@@ -65,6 +65,57 @@ final class TransformerLM extends Module
     }
 
     /**
+     * Batched forward pass for training.
+     *
+     * @param Tensor $tokens  Shape [B, T], each element an integer token id.
+     * @return Tensor         Shape [B*T, vocab].
+     *
+     * Layout: batch item b occupies rows b*T .. b*T+T-1.
+     * The attention mask is block-diagonal causal, so sequences never
+     * attend to each other.
+     */
+    public function forwardBatch(Tensor $tokens): Tensor
+    {
+        $dims = $tokens->shape()->dims();
+        if (count($dims) !== 2) {
+            throw new \RuntimeException(
+                "forwardBatch expects [B, T] input; got " . $tokens->shape()
+            );
+        }
+        [$B, $T] = $dims;
+
+        if ($T > $this->maxSeqLen) {
+            throw new \RuntimeException(
+                "Sequence length {$T} exceeds max {$this->maxSeqLen}."
+            );
+        }
+
+        // Flatten to [B*T] and embed
+        $flat = $tokens->reshape([$B * $T]);
+        $x = $this->tokenEmbed->forward($flat);   // [B*T, dim]
+
+        // Positional ids: 0, 1, ..., T-1 repeated B times
+        $posIds = [];
+        for ($b = 0; $b < $B; $b++) {
+            for ($t = 0; $t < $T; $t++) {
+                $posIds[] = (float) $t;
+            }
+        }
+        $pos = $this->posEmbed->forward(Tensor::fromArray($posIds));  // [B*T, dim]
+        $x = $x->add($pos);
+
+        // Block-diagonal causal mask [B*T, B*T]
+        $mask = Tensor::batchCausalMask($B, $T);
+
+        foreach ($this->blocks as $block) {
+            $x = $block->forward($x, $mask);
+        }
+
+        $x = $this->lnFinal->forward($x);
+        return $this->head->forward($x);   // [B*T, vocab]
+    }
+
+    /**
      * Forward pass with KV cache for autoregressive generation.
      *
      * @param Tensor  $tokens  Full prompt [T] on first call, or [1] on subsequent calls.

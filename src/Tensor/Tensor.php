@@ -604,6 +604,35 @@ class Tensor
         return new self($data, new Shape([$size, $size]));
     }
 
+    /**
+     * Build a batch causal mask of shape [B*T, B*T].
+     *
+     * Position i in batch b can attend to position j in batch b' iff:
+     *     b == b' AND j <= i
+     *
+     * This is a block-diagonal causal mask. Each of the B sequences
+     * can attend to itself but never to another sequence, and never
+     * to its own future positions.
+     *
+     * Used by TransformerLM::forwardBatch().
+     */
+    public static function batchCausalMask(int $B, int $T, float $above = 1.0): self
+    {
+        $N = $B * $T;
+        $data = [];
+        for ($i = 0; $i < $N; $i++) {
+            $bi = intdiv($i, $T);
+            $ti = $i % $T;
+            for ($j = 0; $j < $N; $j++) {
+                $bj = intdiv($j, $T);
+                $tj = $j % $T;
+                $blocked = ($bi !== $bj) || ($tj > $ti);
+                $data[] = $blocked ? $above : 0.0;
+            }
+        }
+        return new self($data, new Shape([$N, $N]));
+    }
+
     public function layerNorm(Tensor $gamma, Tensor $beta, float $eps = 1e-5): self
     {
         $dims = $this->shape->dims();
@@ -740,13 +769,11 @@ class Tensor
         $backend = self::backend();
 
         if (method_exists($backend, 'conv2dForward')) {
-            // ---- Native fast path ----
             $out = $backend->conv2dForward(
                 $this->data, $weight->data(), $bias->data(),
                 $C, $H, $W, $outC, $kH, $kW, $stride, $padding,
             );
         } else {
-            // ---- Pure PHP fallback ----
             $inD = $this->data;
             $wD  = $weight->data();
             $bD  = $bias->data();
