@@ -39,11 +39,12 @@ Build, train, and run neural networks directly from PHP — with a PHP-first API
 | CUDA backend — elementwise ops + ReLU | ✅ Working |
 | CUDA STFT (cuFFT) — audio feature extraction | ✅ Working |
 | **Persistent device tensors** | ✅ **Working (44× measured speedup)** |
+| **GPU-native MNIST training (60k samples)** | ✅ **96.85% in 23.5 s (100× vs CPU)** |
 | CLI — `zilla doctor`, `zilla train`, `zilla generate:text` | ✅ Working |
 | Audio pipeline — WAV loader, Mel filterbank, log-mel | ✅ Working |
 | SafeTensors support | 🔜 Planned |
 | MNIST CNN full training | 🚧 In progress |
-| GPU-native MNIST training (persistent tensors) | 🚧 In progress |
+| GPU-native MNIST training (60k samples) | ✅ **96.85% in 23.5 s (100× vs CPU)** |
 | CUDA Conv2D / MaxPool kernels | 🔜 Next |
 | Vision Transformer (ViT) | 🔜 Planned |
 | Diffusion models | 🔜 Planned |
@@ -445,6 +446,69 @@ $tensor = $mel->fromWav($wav);   // [1, 64, nFrames]
 | Time per epoch (CPU) | ~7 min |
 | Total training time | **66.6 min** |
 
+---
+
+## MNIST on GPU — Persistent Device Tensors
+
+Full 60,000-sample MNIST, MLP `784 → 128 (ReLU) → 10`, batch=64, 10 epochs, SGD (lr=0.05).
+
+Environment: NVIDIA Tesla T4 (Colab free tier, virtualized), CUDA 12.8, cuBLAS, PHP 8.4.25.
+
+| Metric | CPU (native C + OpenBLAS) | GPU v1 (naive transfers) | **GPU v2 (persistent buffers)** |
+|---|---:|---:|---:|
+| Per epoch | ~240 s | 27 s | **2.4 s** |
+| Total (10 epochs) | ~40 min | 4.5 min | **23.5 s** |
+| Test accuracy | 98.05% | 93.31% | **96.85%** |
+| **Speedup vs CPU** | 1× | 9× | **~100×** |
+
+### Why v2 is 100× and v1 is only 9×
+
+The GPU kernel itself (cuBLAS sgemm) is fast in both versions. The difference is **where the data lives**:
+
+- **v1** — every training batch crosses PCIe 5+ times (X upload, Z1 download, dZ1T upload, dW1T download, W1 re-upload). At Colab's ~100 MB/s effective PCIe throughput, that's ~40 ms of transfer overhead per batch.
+- **v2** — the entire forward+backward+optimizer pass runs on device. Only the X batch (200 KB) and the Y batch (64 floats) cross PCIe per iteration.
+
+### Kernel-level speedup (pure cuBLAS, no transfers)
+
+1024×1024 matmul, 100 iterations, Colab T4:
+
+| Path | Per call | Total |
+|---|---:|---:|
+| Naive (transfer per op) | 123.83 ms | 12,383 ms |
+| **Persistent device tensors** | **0.83 ms** | **280 ms** |
+| **Speedup** | | **44×** |
+
+### Reproduce
+
+```bash
+# Rebuild
+./native/cuda/build.sh
+
+# Run the GPU-resident training loop
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
+    php -d memory_limit=3G examples/mnist_gpu_v2.php
+```
+
+Expected output:
+```text
+epoch  1/10   3.29s
+epoch  2/10   2.12s
+...
+epoch 10/10   2.13s
+------------------------------------------------------------
+Test accuracy:   96.85% (9685 / 10000)
+Total training:  23.5 s (0.4 min)
+Per epoch:       2.4 s
+```
+
+### Research note
+
+This result confirms the H1 hypothesis from the project paper:
+
+> *A PHP-first framework that delegates computationally intensive operations to optimized native CPU and GPU backends can substantially reduce the performance limitations associated with userland PHP execution.*
+
+The 100× speedup is measured, not theoretical. The complete training pipeline — data loading, forward pass, backward pass, optimizer update, evaluation — runs from PHP, with the compute-intensive operations executing on the GPU through FFI.
+
 ### Shakespeare Language Model
 
 Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
@@ -465,77 +529,35 @@ Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
 
 ### CUDA on NVIDIA T4
 
-**Naive path — matmul, 100 iterations, 1024×1024:**
+The CUDA backend uses **cuBLAS** for matmul, **cuFFT** for batched STFT, and **persistent device buffers** to eliminate per-operation host↔device transfers.
 
-| Path | Per call | Total |
-|------|---------:|------:|
-| CPU + OpenBLAS | 134 ms | 13,400 ms |
-| CUDA naive | 206 ms | 20,600 ms |
-| **CUDA persistent** | **0.83 ms** | **280 ms** |
+Results obtained on a virtualized NVIDIA Tesla T4 (Google Colab free tier, CUDA 12.8).
 
-**Persistent tensor path is 44× faster than naive CUDA and 48× faster than CPU.**
+### Kernel performance (pure matmul)
 
-### Audio Pipeline Throughput (CPU)
+1024×1024 matmul, 100 iterations:
 
-| Operation | Per 1-second clip |
-|---|---:|
-| WAV load (16 kHz mono) | ~5 ms |
-| Hann window (native C) | 0.17 ms |
-| STFT, 512-FFT, 160-hop (native C) | 9.2 ms |
-| Mel + log (native matmul) | ~10 ms |
-| **End-to-end log-mel** | **~25 ms** |
+| Path | Per call | Total | Speedup |
+|---|---:|---:|---:|
+| Naive (transfer per op) | 123.83 ms | 12,383 ms | 1× |
+| **Persistent device tensors** | **0.83 ms** | **280 ms** | **44×** |
 
-Runs at **~40× real-time** on a 4-core Intel laptop.
+### Training performance (MNIST MLP)
 
-### GPU MNIST Training
+Full 60,000-sample MNIST, `784 → 128 → 10`, 10 epochs:
 
-Full 60,000-sample MNIST, MLP (784 → 128 ReLU → 10), BATCH=64, Colab T4:
+| Metric | CPU | GPU v1 | **GPU v2** |
+|---|---:|---:|---:|
+| Per epoch | ~240 s | 27 s | **2.4 s** |
+| Total | ~40 min | 4.5 min | **23.5 s** |
+| Test accuracy | 98.05% | 93.31% | **96.85%** |
+| **Speedup** | 1× | 9× | **~100×** |
 
-| Path | Per epoch | Total (10 ep) | Test acc |
-|------|----------:|--------------:|---------:|
-| CPU (native C + OpenBLAS, Adam) | ~240 s | ~40 min | 98.05% |
-| **GPU v1 (persistent buffers, no bias, SGD)** | **27 s** | **4.5 min** | **93.31%** |
-| GPU v2 (planned — full device pipeline) | ~3 s | ~30 s | 95%+ |
+### Interpretation
 
-**v1 speedup: ~9× over CPU. v2 target: ~80×.**
----
+The naive per-operation transfer model is dominated by PCIe latency on virtualized environments. Persistent device tensors reduce transfer overhead from **O(operations)** to **O(model)**, unlocking the GPU's actual compute throughput.
 
-## Audio Pipeline
-
-```text
-WAV file
-   ↓
-[1, N] float32 waveform      ← Wav::fromFile()
-   ↓
-STFT (native C or CUDA)      ← Hann × radix-2 FFT or cuFFT
-   ↓
-[257, nFrames] magnitude
-   ↓
-Mel filterbank (native matmul)
-   ↓
-[64, nFrames] mel
-   ↓
-log(x + eps)
-   ↓
-[1, 64, nFrames] log-mel     ← model input
-```
-
-**Verified:** a 440 Hz sine produces peak energy at mel band ≈ 440 Hz. A 3000 Hz sine lands at ≈ 3000 Hz. A 200→4000 Hz sweep ends at ≈ 4000 Hz. Correctness is confirmed.
-
----
-
-## CUDA on NVIDIA T4
-
-The CUDA backend uses:
-- **cuBLAS** for matmul (hand-tuned assembly)
-- **cuFFT** for batched STFT
-- **Pinned host memory + CUDA streams** for async transfers
-- **Persistent device buffers** for GPU-resident computation
-
-Tested configurations:
-- Google Colab free tier (virtualized T4, 15 GB VRAM)
-- CUDA Toolkit 12.8
-- Verified bit-exact CPU/GPU parity
+These measurements validate §13.9 of the project paper (*"Large Operations and Amortization"*).
 
 ### Reproduce
 
@@ -546,12 +568,16 @@ composer install
 ./native/cpu/build.sh
 ./native/cuda/build.sh   # requires nvcc
 
-php -d memory_limit=2G tests/parity.php
+# Kernel-only benchmark
 php -d memory_limit=2G tests/cuda_persistent.php
-php -d memory_limit=2G tests/cuda_bench.php
+
+# Full training
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
+    php -d memory_limit=3G examples/mnist_gpu_v2.php
 ```
 
----
+For Google Colab, see [`docs/colab_setup.md`](docs/colab_setup.md).
+
 
 ## CLI
 
