@@ -69,6 +69,16 @@ final class CudaBackend extends CpuBackend
                 int  mul_dev(int a_id, int b_id, int c_id, int n);
                 int  div_dev(int a_id, int b_id, int c_id, int n);
                 int  relu_dev(int x_id, int y_id, int n);
+                int  add_bias_dev(int x_id, int b_id, int B, int C);
+                int  relu_fwd_dev(int x_id, int y_id, int mask_id, int n);
+                int  relu_bwd_dev(int dy_id, int mask_id, int dx_id, int n);
+                int  softmax_ce_dev(int logits_id, int targets_id, int dlogits_id, int loss_id, int B, int C);
+                int  bias_grad_dev(int dy_id, int db_id, int B, int C);
+                int  sgd_update_dev(int w_id, int dw_id, float lr, int n);
+                int  zero_dev(int id, int n);
+                int  matmul_tn_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int  matmul_nt_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int  copy_dev(int src_id, int dst_id, int n);
                 C,
                 $this->libraryPath
             );
@@ -522,5 +532,69 @@ final class CudaBackend extends CpuBackend
         if ($this->ffi->relu_dev($xId, $yId, $n) !== 0) {
             throw new \RuntimeException("relu_dev failed.");
         }
+    }
+
+        // ==================================================================
+    // Training primitives (v2)
+    // ==================================================================
+
+    public function addBiasDev(int $xId, int $bId, int $B, int $C): void
+    {
+        if ($this->ffi->add_bias_dev($xId, $bId, $B, $C) !== 0)
+            throw new \RuntimeException("add_bias_dev failed.");
+    }
+
+    public function reluFwdDev(int $xId, int $yId, int $maskId, int $n): void
+    {
+        if ($this->ffi->relu_fwd_dev($xId, $yId, $maskId, $n) !== 0)
+            throw new \RuntimeException("relu_fwd_dev failed.");
+    }
+
+    public function reluBwdDev(int $dyId, int $maskId, int $dxId, int $n): void
+    {
+        if ($this->ffi->relu_bwd_dev($dyId, $maskId, $dxId, $n) !== 0)
+            throw new \RuntimeException("relu_bwd_dev failed.");
+    }
+
+    public function softmaxCeDev(int $logitsId, int $targetsId, int $dlogitsId, int $lossId, int $B, int $C): void
+    {
+        if ($this->ffi->softmax_ce_dev($logitsId, $targetsId, $dlogitsId, $lossId, $B, $C) !== 0)
+            throw new \RuntimeException("softmax_ce_dev failed.");
+    }
+
+    public function biasGradDev(int $dyId, int $dbId, int $B, int $C): void
+    {
+        if ($this->ffi->bias_grad_dev($dyId, $dbId, $B, $C) !== 0)
+            throw new \RuntimeException("bias_grad_dev failed.");
+    }
+
+    public function sgdUpdateDev(int $wId, int $dwId, float $lr, int $n): void
+    {
+        if ($this->ffi->sgd_update_dev($wId, $dwId, $lr, $n) !== 0)
+            throw new \RuntimeException("sgd_update_dev failed.");
+    }
+
+    public function zeroDev(int $id, int $n): void
+    {
+        if ($this->ffi->zero_dev($id, $n) !== 0)
+            throw new \RuntimeException("zero_dev failed.");
+    }
+
+    public function matmulTnDev(int $aId, int $bId, int $cId, int $M, int $K, int $N): void
+    {
+        if ($this->ffi->matmul_tn_dev($aId, $bId, $cId, $M, $K, $N) !== 0)
+            throw new \RuntimeException("matmul_tn_dev failed.");
+    }
+
+    public function matmulNtDev(int $aId, int $bId, int $cId, int $M, int $K, int $N): void
+    {
+        if ($this->ffi->matmul_nt_dev($aId, $bId, $cId, $M, $K, $N) !== 0)
+            throw new \RuntimeException("matmul_nt_dev failed.");
+    }
+
+    public function copyDev(int $srcId, int $dstId, int $n): void
+    {
+        if ($this->ffi->copy_dev($srcId, $dstId, $n) !== 0)
+            throw new \RuntimeException("copy_dev failed.");
     }
 }

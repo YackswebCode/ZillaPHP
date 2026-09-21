@@ -25,7 +25,7 @@ nvcc -O3 -shared -Xcompiler -fPIC \
     -gencode arch=compute_80,code=sm_80 \
     -o libzilla_cuda.so \
     matmul.cu elementwise.cu audio.cu \
-    buffer_registry.cu device_ops.cu \
+    buffer_registry.cu device_ops.cu training_ops.cu \
     -lcudart -lcublas -lcufft
     
 echo "Built: $(pwd)/libzilla_cuda.so"
