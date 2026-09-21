@@ -47,6 +47,8 @@ final class CudaBackend extends CpuBackend
                 void sub_f32_cuda(const float* A, const float* B, float* C, int N);
                 void mul_f32_cuda(const float* A, const float* B, float* C, int N);
                 void div_f32_cuda(const float* A, const float* B, float* C, int N);
+                void hann_window_cuda(float* w, int N);
+                void stft_magnitude_cuda(const float* input, int inputLen, const float* window, int fftSize, int hopSize, float* output, int* outNBins, int* outNFrames);
                 C,
                 $this->libraryPath
             );
@@ -157,14 +159,17 @@ final class CudaBackend extends CpuBackend
     {
         return $this->elementwiseCuda($a, $b, 'add_f32_cuda', 'add');
     }
+
     public function subtract(Tensor $a, Tensor $b): Tensor
     {
         return $this->elementwiseCuda($a, $b, 'sub_f32_cuda', 'subtract');
     }
+
     public function multiply(Tensor $a, Tensor $b): Tensor
     {
         return $this->elementwiseCuda($a, $b, 'mul_f32_cuda', 'multiply');
     }
+
     public function divide(Tensor $a, Tensor $b): Tensor
     {
         return $this->elementwiseCuda($a, $b, 'div_f32_cuda', 'divide');
@@ -211,5 +216,105 @@ final class CudaBackend extends CpuBackend
             $a->dtype(),
             $a->device()
         );
+    }
+
+    // ==================================================================
+    // Audio: Hann window + STFT (cuFFT-backed)
+    // ==================================================================
+
+    /**
+     * Generate a Hann window of length N on the GPU.
+     *
+     * @return float[]  length-N array, w[0] = w[N-1] = 0, w[N/2] = 1
+     */
+    public function hannWindow(int $n): array
+    {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        if ($n < 1) {
+            throw new \InvalidArgumentException("Window length must be >= 1.");
+        }
+
+        $w = $this->ffi->new("float[{$n}]");
+        $this->ffi->hann_window_cuda($w, $n);
+        return $this->fromC($w, $n);
+    }
+
+    /**
+     * STFT magnitude of a mono waveform using cuFFT.
+     *
+     * Note: the $window argument is currently ignored — the CUDA kernel
+     * regenerates the Hann window on-device and caches it. Kept in the
+     * signature for API compatibility with NativeCpuBackend.
+     *
+     * @param float[] $input    audio samples in [-1, 1]
+     * @param float[] $window   Hann window (see note above)
+     * @param int     $fftSize  power of two, <= 16384
+     * @param int     $hopSize  frame hop
+     *
+     * @return array{0: float[], 1: int, 2: int}
+     *         [magnitude, nBins, nFrames]
+     *         magnitude is row-major [nBins, nFrames],
+     *         access via mag[bin * nFrames + frame]
+     */
+    public function stftMagnitude(
+        array $input,
+        array $window,
+        int $fftSize,
+        int $hopSize,
+    ): array {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        if (count($window) !== $fftSize) {
+            throw new \InvalidArgumentException(
+                "Window length (" . count($window) . ") must equal fftSize ({$fftSize})."
+            );
+        }
+        if ($fftSize < 2 || ($fftSize & ($fftSize - 1)) !== 0) {
+            throw new \InvalidArgumentException("fftSize must be a power of two.");
+        }
+        if ($fftSize > 16384) {
+            throw new \InvalidArgumentException("fftSize must be <= 16384.");
+        }
+        if ($hopSize < 1) {
+            throw new \InvalidArgumentException("hopSize must be >= 1.");
+        }
+
+        $inputLen = count($input);
+        $inC      = $this->toC($input);
+        $winC     = $this->toC($window);   // passed for signature parity; kernel ignores
+
+        // Upper bound on (nBins * nFrames)
+        $nBins     = intdiv($fftSize, 2) + 1;
+        $maxFrames = $inputLen < $fftSize
+            ? 1
+            : 1 + intdiv($inputLen - $fftSize, $hopSize);
+        $outSize   = $nBins * max($maxFrames, 1);
+
+        $outC   = $this->ffi->new("float[{$outSize}]");
+        $nBinsC = $this->ffi->new("int[1]");
+        $nFrC   = $this->ffi->new("int[1]");
+
+        $this->ffi->stft_magnitude_cuda(
+            $inC, $inputLen, $winC, $fftSize, $hopSize,
+            $outC, $nBinsC, $nFrC,
+        );
+
+        $nBinsOut   = (int) $nBinsC[0];
+        $nFramesOut = (int) $nFrC[0];
+
+        if ($nBinsOut === 0 || $nFramesOut === 0) {
+            throw new \RuntimeException(
+                "CUDA STFT failed — check fftSize, window length, and hopSize."
+            );
+        }
+
+        return [
+            $this->fromC($outC, $nBinsOut * $nFramesOut),
+            $nBinsOut,
+            $nFramesOut,
+        ];
     }
 }
