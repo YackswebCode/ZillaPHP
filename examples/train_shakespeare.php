@@ -14,7 +14,7 @@ use ZillaPHP\Transformers\TransformerLM;
 Application::boot(native: true);
 
 // ====================================================================
-// Configuration
+// Data configuration
 // ====================================================================
 $TEXT_FILE       = __DIR__ . '/../data/shakespeare.txt';
 $TRAIN_CHARS     = (int)   (getenv('TRAIN_CHARS')     ?: 50000);
@@ -23,6 +23,14 @@ $EPOCHS          = (int)   (getenv('EPOCHS')          ?: 1);
 $LR              = (float) (getenv('LR')              ?: 0.003);
 $STEPS_PER_EPOCH = (int)   (getenv('STEPS_PER_EPOCH') ?: 100);
 $LOG_EVERY       = (int)   (getenv('LOG_EVERY')       ?: 20);
+
+// ====================================================================
+// Model configuration
+// ====================================================================
+$DIM    = (int) (getenv('DIM')    ?: 64);
+$HEADS  = (int) (getenv('HEADS')  ?: 4);
+$LAYERS = (int) (getenv('LAYERS') ?: 2);
+$FFN    = (int) (getenv('FFN')    ?: $DIM * 2);
 
 $CHECKPOINT = __DIR__ . '/../checkpoints/shakespeare.zilla.json';
 
@@ -39,6 +47,7 @@ echo "ZillaPHP — Tiny Shakespeare LM\n";
 echo str_repeat('=', 66) . "\n";
 printf("Training chars: %d   Sequence length: %d\n", $TRAIN_CHARS, $SEQ_LEN);
 printf("Epochs: %d   Steps/epoch: %d   LR: %.4f\n", $EPOCHS, $STEPS_PER_EPOCH, $LR);
+printf("Model: dim=%d  heads=%d  layers=%d  ffn=%d\n", $DIM, $HEADS, $LAYERS, $FFN);
 printf("Backend: %s\n", Tensor::backend()->name());
 echo str_repeat('=', 66) . "\n\n";
 
@@ -51,11 +60,11 @@ echo "Total tokens: " . count($ids) . "\n\n";
 // ---- Model --------------------------------------------------------
 $model = new TransformerLM(
     vocabSize:  $tokenizer->vocabSize(),
-    dim:        64,
-    heads:      4,
-    layers:     2,
+    dim:        $DIM,
+    heads:      $HEADS,
+    layers:     $LAYERS,
     maxSeqLen:  $SEQ_LEN,
-    ffnHidden:  128,
+    ffnHidden:  $FFN,
 );
 
 $params = $model->parameters();
@@ -71,8 +80,8 @@ $ckptDir = dirname($CHECKPOINT);
 if (!is_dir($ckptDir)) mkdir($ckptDir, 0777, true);
 
 // ---- Training loop ------------------------------------------------
-$startTime  = microtime(true);
-$globalStep = 0;
+$startTime   = microtime(true);
+$globalStep  = 0;
 $runningLoss = 0.0;
 
 for ($epoch = 0; $epoch < $EPOCHS; $epoch++) {
@@ -114,9 +123,9 @@ for ($epoch = 0; $epoch < $EPOCHS; $epoch++) {
         'epoch'       => $epoch,
         'vocab_size'  => $tokenizer->vocabSize(),
         'seq_len'     => $SEQ_LEN,
-        'dim'         => 64,
-        'heads'       => 4,
-        'layers'      => 2,
+        'dim'         => $DIM,
+        'heads'       => $HEADS,
+        'layers'      => $LAYERS,
         'train_chars' => $TRAIN_CHARS,
     ]);
     echo "\nSaved: {$CHECKPOINT}\n\n";
