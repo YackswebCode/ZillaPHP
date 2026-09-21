@@ -96,3 +96,157 @@ float sum_f32(const float* X, int N) {
     for (int i = 0; i < N; i++) s += X[i];
     return s;
 }
+
+/* ==================================================================
+ * Conv2D (forward + backward)
+ *
+ *   input  : [C, H, W]
+ *   weight : [outC, C, kH, kW]
+ *   bias   : [outC]
+ *   output : [outC, outH, outW]
+ *
+ *   outH = (H + 2*padding - kH) / stride + 1
+ *   outW = (W + 2*padding - kW) / stride + 1
+ * ================================================================== */
+
+void conv2d_forward_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int C, int H, int W,
+    int outC, int kH, int kW,
+    int stride, int padding
+) {
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+
+    for (int oc = 0; oc < outC; oc++) {
+        for (int oh = 0; oh < outH; oh++) {
+            for (int ow = 0; ow < outW; ow++) {
+                float sum = bias[oc];
+                for (int c = 0; c < C; c++) {
+                    const float* inBase = input + (size_t)c * H * W;
+                    const float* wBase  = weight + ((size_t)oc * C + c) * kH * kW;
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh * stride - padding + kh;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int kw = 0; kw < kW; kw++) {
+                            int iw = ow * stride - padding + kw;
+                            if (iw < 0 || iw >= W) continue;
+                            sum += inBase[ih * W + iw] * wBase[kh * kW + kw];
+                        }
+                    }
+                }
+                output[((size_t)oc * outH + oh) * outW + ow] = sum;
+            }
+        }
+    }
+}
+
+void conv2d_backward_f32(
+    const float* input,
+    const float* weight,
+    const float* gradOutput,
+    float* gradInput,
+    float* gradWeight,
+    float* gradBias,
+    int C, int H, int W,
+    int outC, int kH, int kW,
+    int stride, int padding
+) {
+    int outH = (H + 2 * padding - kH) / stride + 1;
+    int outW = (W + 2 * padding - kW) / stride + 1;
+
+    /* zero gradInput and gradWeight */
+    for (size_t i = 0; i < (size_t)C * H * W; i++) gradInput[i] = 0.0f;
+    for (size_t i = 0; i < (size_t)outC * C * kH * kW; i++) gradWeight[i] = 0.0f;
+    for (int i = 0; i < outC; i++) gradBias[i] = 0.0f;
+
+    for (int oc = 0; oc < outC; oc++) {
+        for (int oh = 0; oh < outH; oh++) {
+            for (int ow = 0; ow < outW; ow++) {
+                float g = gradOutput[((size_t)oc * outH + oh) * outW + ow];
+                gradBias[oc] += g;
+
+                for (int c = 0; c < C; c++) {
+                    const float* inBase = input + (size_t)c * H * W;
+                    float* giBase = gradInput + (size_t)c * H * W;
+                    float* gwBase = gradWeight + ((size_t)oc * C + c) * kH * kW;
+
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh * stride - padding + kh;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int kw = 0; kw < kW; kw++) {
+                            int iw = ow * stride - padding + kw;
+                            if (iw < 0 || iw >= W) continue;
+
+                            size_t iIdx = (size_t)ih * W + iw;
+                            size_t wIdx = (size_t)kh * kW + kw;
+
+                            giBase[iIdx]  += g * weight[((size_t)oc * C + c) * kH * kW + wIdx];
+                            gwBase[wIdx]  += g * inBase[iIdx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ==================================================================
+ * MaxPool2D (forward + backward)
+ * ================================================================== */
+
+void maxpool2d_forward_f32(
+    const float* input,
+    float* output,
+    int* argmax,
+    int C, int H, int W,
+    int kH, int kW, int stride
+) {
+    int outH = (H - kH) / stride + 1;
+    int outW = (W - kW) / stride + 1;
+
+    for (int c = 0; c < C; c++) {
+        const float* inBase = input + (size_t)c * H * W;
+        for (int oh = 0; oh < outH; oh++) {
+            for (int ow = 0; ow < outW; ow++) {
+                float best = -1e30f;
+                int bestIdx = 0;
+                for (int kh = 0; kh < kH; kh++) {
+                    for (int kw = 0; kw < kW; kw++) {
+                        int ih = oh * stride + kh;
+                        int iw = ow * stride + kw;
+                        size_t idx = (size_t)ih * W + iw;
+                        float v = inBase[idx];
+                        if (v > best) { best = v; bestIdx = (int)idx; }
+                    }
+                }
+                size_t oIdx = ((size_t)c * outH + oh) * outW + ow;
+                output[oIdx] = best;
+                argmax[oIdx] = bestIdx;
+            }
+        }
+    }
+}
+
+void maxpool2d_backward_f32(
+    const float* gradOutput,
+    const int* argmax,
+    float* gradInput,
+    int C, int H, int W,
+    int outH, int outW
+) {
+    for (size_t i = 0; i < (size_t)C * H * W; i++) gradInput[i] = 0.0f;
+
+    for (int c = 0; c < C; c++) {
+        float* giBase = gradInput + (size_t)c * H * W;
+        for (int oh = 0; oh < outH; oh++) {
+            for (int ow = 0; ow < outW; ow++) {
+                size_t oIdx = ((size_t)c * outH + oh) * outW + ow;
+                giBase[argmax[oIdx]] += gradOutput[oIdx];
+            }
+        }
+    }
+}

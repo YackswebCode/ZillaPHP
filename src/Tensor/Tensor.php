@@ -108,8 +108,6 @@ class Tensor
     }
 
     /**
-     * Stack an array of [1, D] tensors into a single [N, D] tensor.
-     *
      * @param Tensor[] $tensors
      */
     public static function concatRows(array $tensors): self
@@ -141,9 +139,6 @@ class Tensor
     }
 
     /**
-     * Concatenate N 2D tensors of shape [N_i, D] along axis 0.
-     * Result is [sum(N_i), D]. Used to grow a KV cache.
-     *
      * @param Tensor[] $tensors
      */
     public static function concatAlongRows(array $tensors): self
@@ -405,7 +400,25 @@ class Tensor
                 "] — element count {$target} vs {$this->shape->size()}"
             );
         }
-        return new self($this->data, new Shape($newShape), $this->dtype, $this->device);
+
+        $result = new self($this->data, new Shape($newShape), $this->dtype, $this->device);
+
+        if (self::gradEnabled() && $this->requiresGrad) {
+            $origShape = $this->shape->dims();
+            self::attachAutograd(
+                $result,
+                [$this],
+                'reshape',
+                function (Tensor $g) use ($result, $origShape): void {
+                    $input = $result->inputs[0];
+                    $input->accumulateGradPublic(
+                        new self($g->data(), new Shape($origShape))
+                    );
+                },
+            );
+        }
+
+        return $result;
     }
 
     public function sliceRows(int $start, int $end): self
@@ -685,6 +698,254 @@ class Tensor
                     if ($beta->requiresGrad) {
                         $beta->accumulateGradPublic(new self($gradBeta, $beta->shape()));
                     }
+                },
+            );
+        }
+
+        return $result;
+    }
+
+    // ==================================================================
+    // Vision ops
+    // ==================================================================
+
+    /**
+     * 2D convolution. Uses the native kernel when available.
+     */
+    public function conv2d(
+        Tensor $weight,
+        Tensor $bias,
+        int $stride = 1,
+        int $padding = 0,
+    ): self {
+        $inShape  = $this->shape->dims();
+        $wShape   = $weight->shape()->dims();
+
+        if (count($inShape) !== 3) {
+            throw new \RuntimeException("conv2d input must be [C, H, W].");
+        }
+        if (count($wShape) !== 4) {
+            throw new \RuntimeException("conv2d weight must be [outC, C, kH, kW].");
+        }
+
+        [$C, $H, $W]           = $inShape;
+        [$outC, $Cw, $kH, $kW] = $wShape;
+        if ($Cw !== $C) {
+            throw new \InvalidArgumentException("conv2d: channel mismatch ({$C} vs {$Cw}).");
+        }
+
+        $outH = intdiv($H + 2 * $padding - $kH, $stride) + 1;
+        $outW = intdiv($W + 2 * $padding - $kW, $stride) + 1;
+
+        $backend = self::backend();
+
+        if (method_exists($backend, 'conv2dForward')) {
+            // ---- Native fast path ----
+            $out = $backend->conv2dForward(
+                $this->data, $weight->data(), $bias->data(),
+                $C, $H, $W, $outC, $kH, $kW, $stride, $padding,
+            );
+        } else {
+            // ---- Pure PHP fallback ----
+            $inD = $this->data;
+            $wD  = $weight->data();
+            $bD  = $bias->data();
+            $out = [];
+            for ($oc = 0; $oc < $outC; $oc++) {
+                for ($oh = 0; $oh < $outH; $oh++) {
+                    for ($ow = 0; $ow < $outW; $ow++) {
+                        $sum = $bD[$oc];
+                        for ($c = 0; $c < $C; $c++) {
+                            $inCBase = $c * $H * $W;
+                            $wCBase  = $oc * $C * $kH * $kW + $c * $kH * $kW;
+                            for ($kh = 0; $kh < $kH; $kh++) {
+                                $ih = $oh * $stride - $padding + $kh;
+                                if ($ih < 0 || $ih >= $H) continue;
+                                for ($kw = 0; $kw < $kW; $kw++) {
+                                    $iw = $ow * $stride - $padding + $kw;
+                                    if ($iw < 0 || $iw >= $W) continue;
+                                    $sum += $inD[$inCBase + $ih * $W + $iw]
+                                          * $wD[$wCBase + $kh * $kW + $kw];
+                                }
+                            }
+                        }
+                        $out[] = $sum;
+                    }
+                }
+            }
+        }
+
+        $result = new self($out, new Shape([$outC, $outH, $outW]), $this->dtype, $this->device);
+
+        if (self::gradEnabled()
+            && ($this->requiresGrad || $weight->requiresGrad || $bias->requiresGrad)
+        ) {
+            self::attachAutograd(
+                $result,
+                [$this, $weight, $bias],
+                'conv2d',
+                function (Tensor $g) use (
+                    $result, $outC, $outH, $outW, $C, $H, $W, $kH, $kW,
+                    $stride, $padding
+                ): void {
+                    [$input, $weight, $bias] = $result->inputs;
+                    $backend = self::backend();
+
+                    if (method_exists($backend, 'conv2dBackward')) {
+                        [$gradInput, $gradWeight, $gradBias] = $backend->conv2dBackward(
+                            $input->data(), $weight->data(), $g->data(),
+                            $C, $H, $W, $outC, $kH, $kW, $stride, $padding,
+                        );
+                    } else {
+                        $inD = $input->data();
+                        $wD  = $weight->data();
+                        $gd  = $g->data();
+
+                        $gradInput  = array_fill(0, $C * $H * $W, 0.0);
+                        $gradWeight = array_fill(0, $outC * $C * $kH * $kW, 0.0);
+                        $gradBias   = array_fill(0, $outC, 0.0);
+
+                        for ($oc = 0; $oc < $outC; $oc++) {
+                            for ($oh = 0; $oh < $outH; $oh++) {
+                                for ($ow = 0; $ow < $outW; $ow++) {
+                                    $gVal = $gd[$oc * $outH * $outW + $oh * $outW + $ow];
+                                    $gradBias[$oc] += $gVal;
+
+                                    for ($c = 0; $c < $C; $c++) {
+                                        $inCBase = $c * $H * $W;
+                                        $wCBase  = $oc * $C * $kH * $kW + $c * $kH * $kW;
+                                        for ($kh = 0; $kh < $kH; $kh++) {
+                                            $ih = $oh * $stride - $padding + $kh;
+                                            if ($ih < 0 || $ih >= $H) continue;
+                                            for ($kw = 0; $kw < $kW; $kw++) {
+                                                $iw = $ow * $stride - $padding + $kw;
+                                                if ($iw < 0 || $iw >= $W) continue;
+
+                                                $iIdx = $inCBase + $ih * $W + $iw;
+                                                $wIdx = $wCBase + $kh * $kW + $kw;
+
+                                                $gradInput[$iIdx]  += $gVal * $wD[$wIdx];
+                                                $gradWeight[$wIdx] += $gVal * $inD[$iIdx];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if ($input->requiresGrad) {
+                        $input->accumulateGradPublic(new self($gradInput, $input->shape()));
+                    }
+                    if ($weight->requiresGrad) {
+                        $weight->accumulateGradPublic(new self($gradWeight, $weight->shape()));
+                    }
+                    if ($bias->requiresGrad) {
+                        $bias->accumulateGradPublic(new self($gradBias, $bias->shape()));
+                    }
+                },
+            );
+        }
+
+        return $result;
+    }
+
+    /**
+     * Max pooling. Uses the native kernel when available.
+     */
+    public function maxPool2d(int $kernelSize, ?int $stride = null): self
+    {
+        $stride ??= $kernelSize;
+
+        $dims = $this->shape->dims();
+        if (count($dims) !== 3) {
+            throw new \RuntimeException("maxPool2d input must be [C, H, W].");
+        }
+        [$C, $H, $W] = $dims;
+        $outH = intdiv($H - $kernelSize, $stride) + 1;
+        $outW = intdiv($W - $kernelSize, $stride) + 1;
+
+        $backend = self::backend();
+
+        if (method_exists($backend, 'maxPool2dForward')) {
+            [$out, $argmax] = $backend->maxPool2dForward(
+                $this->data, $C, $H, $W, $kernelSize, $kernelSize, $stride
+            );
+        } else {
+            $inD = $this->data;
+            $out = [];
+            $argmax = [];
+
+            for ($c = 0; $c < $C; $c++) {
+                $inCBase = $c * $H * $W;
+                for ($oh = 0; $oh < $outH; $oh++) {
+                    for ($ow = 0; $ow < $outW; $ow++) {
+                        $best = -INF;
+                        $bestIdx = 0;
+                        for ($kh = 0; $kh < $kernelSize; $kh++) {
+                            for ($kw = 0; $kw < $kernelSize; $kw++) {
+                                $ih = $oh * $stride + $kh;
+                                $iw = $ow * $stride + $kw;
+                                $idx = $inCBase + $ih * $W + $iw;
+                                $v = $inD[$idx];
+                                if ($v > $best) { $best = $v; $bestIdx = $idx; }
+                            }
+                        }
+                        $out[] = $best;
+                        $argmax[] = $bestIdx;
+                    }
+                }
+            }
+        }
+
+        $result = new self($out, new Shape([$C, $outH, $outW]), $this->dtype, $this->device);
+
+        if (self::gradEnabled() && $this->requiresGrad) {
+            self::attachAutograd(
+                $result,
+                [$this],
+                'max_pool2d',
+                function (Tensor $g) use ($result, $argmax, $C, $H, $W, $outH, $outW): void {
+                    $input = $result->inputs[0];
+                    $backend = self::backend();
+
+                    if (method_exists($backend, 'maxPool2dBackward')) {
+                        $gradInput = $backend->maxPool2dBackward(
+                            $g->data(), $argmax, $C, $H, $W, $outH, $outW
+                        );
+                    } else {
+                        $gradInput = array_fill(0, $C * $H * $W, 0.0);
+                        $gd = $g->data();
+                        foreach ($argmax as $i => $idx) {
+                            $gradInput[$idx] += $gd[$i];
+                        }
+                    }
+                    $input->accumulateGradPublic(new self($gradInput, $input->shape()));
+                },
+            );
+        }
+
+        return $result;
+    }
+
+    public function flatten(): self
+    {
+        $dims = $this->shape->dims();
+        $total = array_product($dims);
+
+        $result = new self($this->data, new Shape([1, $total]), $this->dtype, $this->device);
+
+        if (self::gradEnabled() && $this->requiresGrad) {
+            $origShape = $dims;
+            self::attachAutograd(
+                $result,
+                [$this],
+                'flatten',
+                function (Tensor $g) use ($result, $origShape): void {
+                    $input = $result->inputs[0];
+                    $input->accumulateGradPublic(
+                        new self($g->data(), new Shape($origShape))
+                    );
                 },
             );
         }

@@ -6,17 +6,12 @@ namespace ZillaPHP\Hardware\CPU;
 
 use FFI;
 use FFI\CData;
-use ZillaPHP\Tensor\Shape\Shape;   
+use ZillaPHP\Tensor\Shape\Shape;
 use ZillaPHP\Tensor\Tensor;
 
 /**
  * CPU backend that delegates heavy numerical kernels to a compiled
  * C shared library loaded via PHP FFI.
- *
- * Falls back transparently to pure-PHP CpuBackend if:
- *   - the FFI extension is not enabled
- *   - the shared library is missing
- *   - the current operation is not implemented natively
  */
 final class NativeCpuBackend extends CpuBackend
 {
@@ -44,6 +39,10 @@ final class NativeCpuBackend extends CpuBackend
                 void  mul_f32(const float* A, const float* B, float* C, int N);
                 void  div_f32(const float* A, const float* B, float* C, int N);
                 float sum_f32(const float* X, int N);
+                void  conv2d_forward_f32(const float* input, const float* weight, const float* bias, float* output, int C, int H, int W, int outC, int kH, int kW, int stride, int padding);
+                void  conv2d_backward_f32(const float* input, const float* weight, const float* gradOutput, float* gradInput, float* gradWeight, float* gradBias, int C, int H, int W, int outC, int kH, int kW, int stride, int padding);
+                void  maxpool2d_forward_f32(const float* input, float* output, int* argmax, int C, int H, int W, int kH, int kW, int stride);
+                void  maxpool2d_backward_f32(const float* gradOutput, const int* argmax, float* gradInput, int C, int H, int W, int outH, int outW);
                 C,
                 $this->libraryPath
             );
@@ -88,7 +87,7 @@ final class NativeCpuBackend extends CpuBackend
     }
 
     // ==================================================================
-    // Overridden kernels
+    // Basic kernels
     // ==================================================================
 
     public function matmul(Tensor $a, Tensor $b): Tensor
@@ -212,5 +211,146 @@ final class NativeCpuBackend extends CpuBackend
             $a->dtype(),
             $a->device()
         );
+    }
+
+    // ==================================================================
+    // Conv2D / MaxPool2D
+    // ==================================================================
+
+    /**
+     * @return float[]
+     */
+    public function conv2dForward(
+        array $inputData,
+        array $weightData,
+        array $biasData,
+        int $C, int $H, int $W,
+        int $outC, int $kH, int $kW,
+        int $stride, int $padding,
+    ): array {
+        if (!$this->loaded) {
+            throw new \RuntimeException("Native backend not loaded.");
+        }
+
+        $outH = intdiv($H + 2 * $padding - $kH, $stride) + 1;
+        $outW = intdiv($W + 2 * $padding - $kW, $stride) + 1;
+
+        $inC   = $this->toC($inputData);
+        $wC    = $this->toC($weightData);
+        $bC    = $this->toC($biasData);
+        $outC_ = $this->ffi->new("float[" . ($outC * $outH * $outW) . "]");
+
+        $this->ffi->conv2d_forward_f32(
+            $inC, $wC, $bC, $outC_,
+            $C, $H, $W,
+            $outC, $kH, $kW,
+            $stride, $padding,
+        );
+
+        return $this->fromC($outC_, $outC * $outH * $outW);
+    }
+
+    /**
+     * @return array{0: float[], 1: float[], 2: float[]}
+     */
+    public function conv2dBackward(
+        array $inputData,
+        array $weightData,
+        array $gradOutputData,
+        int $C, int $H, int $W,
+        int $outC, int $kH, int $kW,
+        int $stride, int $padding,
+    ): array {
+        if (!$this->loaded) {
+            throw new \RuntimeException("Native backend not loaded.");
+        }
+
+        $inC  = $this->toC($inputData);
+        $wC   = $this->toC($weightData);
+        $gC   = $this->toC($gradOutputData);
+        $giC  = $this->ffi->new("float[" . ($C * $H * $W) . "]");
+        $gwC  = $this->ffi->new("float[" . ($outC * $C * $kH * $kW) . "]");
+        $gbC  = $this->ffi->new("float[" . $outC . "]");
+
+        $this->ffi->conv2d_backward_f32(
+            $inC, $wC, $gC,
+            $giC, $gwC, $gbC,
+            $C, $H, $W,
+            $outC, $kH, $kW,
+            $stride, $padding,
+        );
+
+        return [
+            $this->fromC($giC, $C * $H * $W),
+            $this->fromC($gwC, $outC * $C * $kH * $kW),
+            $this->fromC($gbC, $outC),
+        ];
+    }
+
+    /**
+     * @return array{0: float[], 1: int[]}
+     */
+    public function maxPool2dForward(
+        array $inputData,
+        int $C, int $H, int $W,
+        int $kH, int $kW, int $stride,
+    ): array {
+        if (!$this->loaded) {
+            throw new \RuntimeException("Native backend not loaded.");
+        }
+
+        $outH = intdiv($H - $kH, $stride) + 1;
+        $outW = intdiv($W - $kW, $stride) + 1;
+
+        $inC    = $this->toC($inputData);
+        $outC_  = $this->ffi->new("float[" . ($C * $outH * $outW) . "]");
+        $argmax = $this->ffi->new("int[" . ($C * $outH * $outW) . "]");
+
+        $this->ffi->maxpool2d_forward_f32(
+            $inC, $outC_, $argmax,
+            $C, $H, $W,
+            $kH, $kW, $stride,
+        );
+
+        $outData = $this->fromC($outC_, $C * $outH * $outW);
+        $n = $C * $outH * $outW;
+        $argArr = [];
+        for ($i = 0; $i < $n; $i++) {
+            $argArr[] = (int) $argmax[$i];
+        }
+
+        return [$outData, $argArr];
+    }
+
+    /**
+     * @param int[] $argmax
+     * @return float[]
+     */
+    public function maxPool2dBackward(
+        array $gradOutputData,
+        array $argmax,
+        int $C, int $H, int $W,
+        int $outH, int $outW,
+    ): array {
+        if (!$this->loaded) {
+            throw new \RuntimeException("Native backend not loaded.");
+        }
+
+        $gC = $this->toC($gradOutputData);
+
+        $argC = $this->ffi->new("int[" . count($argmax) . "]");
+        foreach ($argmax as $i => $v) {
+            $argC[$i] = (int) $v;
+        }
+
+        $giC = $this->ffi->new("float[" . ($C * $H * $W) . "]");
+
+        $this->ffi->maxpool2d_backward_f32(
+            $gC, $argC, $giC,
+            $C, $H, $W,
+            $outH, $outW,
+        );
+
+        return $this->fromC($giC, $C * $H * $W);
     }
 }
