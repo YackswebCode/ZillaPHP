@@ -1,14 +1,8 @@
 /*
  * matmul.cu — CUDA matrix multiplication kernel.
  *
- * Computes C[M,N] = A[M,K] @ B[K,N]  (row-major).
- *
- * Compile on a machine with CUDA:
- *   nvcc -O3 -shared -Xcompiler -fPIC -o libzilla_cuda.so *.cu
- *
- * NOTE: The entire file is guarded by __CUDACC__ so that editors
- * (VS Code, clangd) using a non-CUDA compiler do not report errors
- * on CUDA-only keywords. nvcc defines __CUDACC__ automatically.
+ * Uses persistent scratch buffers to avoid the ~40ms/call cudaMalloc
+ * penalty on virtualized GPUs (Colab's T4).
  */
 
 #ifdef __CUDACC__
@@ -63,6 +57,35 @@ __global__ void matmul_kernel(
     }
 }
 
+/* -------- Persistent scratch buffers -------- */
+static float* g_A  = NULL;
+static float* g_B  = NULL;
+static float* g_C  = NULL;
+static size_t g_cap = 0;   // capacity in BYTES
+
+static void ensure_capacity(size_t need) {
+    if (need <= g_cap) return;
+
+    // Round up to next 16 MB to reduce reallocations
+    size_t newcap = ((need + (16u << 20) - 1) / (16u << 20)) * (16u << 20);
+
+    if (g_A) cudaFree(g_A);
+    if (g_B) cudaFree(g_B);
+    if (g_C) cudaFree(g_C);
+
+    cudaError_t e1 = cudaMalloc((void**)&g_A, newcap);
+    cudaError_t e2 = cudaMalloc((void**)&g_B, newcap);
+    cudaError_t e3 = cudaMalloc((void**)&g_C, newcap);
+
+    if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+        fprintf(stderr, "CUDA buffer alloc failed (%zu bytes): %s\n",
+                newcap, cudaGetErrorString(cudaGetLastError()));
+        g_cap = 0;
+        return;
+    }
+    g_cap = newcap;
+}
+
 void matmul_f32(
     const float* A_host,
     const float* B_host,
@@ -72,46 +95,27 @@ void matmul_f32(
     size_t sizeA = (size_t)M * K * sizeof(float);
     size_t sizeB = (size_t)K * N * sizeof(float);
     size_t sizeC = (size_t)M * N * sizeof(float);
+    size_t need  = sizeA > sizeB ? sizeA : sizeB;
+    if (sizeC > need) need = sizeC;
 
-    float *A_dev = NULL, *B_dev = NULL, *C_dev = NULL;
-    cudaError_t err;
+    ensure_capacity(need);
+    if (g_cap == 0) return;
 
-    err = cudaMalloc((void**)&A_dev, sizeA);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc A failed: %s\n", cudaGetErrorString(err));
-        return;
-    }
-    err = cudaMalloc((void**)&B_dev, sizeB);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc B failed: %s\n", cudaGetErrorString(err));
-        cudaFree(A_dev); return;
-    }
-    err = cudaMalloc((void**)&C_dev, sizeC);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc C failed: %s\n", cudaGetErrorString(err));
-        cudaFree(A_dev); cudaFree(B_dev); return;
-    }
-
-    cudaMemcpy(A_dev, A_host, sizeA, cudaMemcpyHostToDevice);
-    cudaMemcpy(B_dev, B_host, sizeB, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_A, A_host, sizeA, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_B, B_host, sizeB, cudaMemcpyHostToDevice);
 
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
 
-    matmul_kernel<<<grid, block>>>(A_dev, B_dev, C_dev, M, K, N);
+    matmul_kernel<<<grid, block>>>(g_A, g_B, g_C, M, K, N);
 
-    err = cudaDeviceSynchronize();
+    cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA matmul kernel error: %s\n", cudaGetErrorString(err));
-        cudaFree(A_dev); cudaFree(B_dev); cudaFree(C_dev);
         return;
     }
 
-    cudaMemcpy(C_host, C_dev, sizeC, cudaMemcpyDeviceToHost);
-
-    cudaFree(A_dev);
-    cudaFree(B_dev);
-    cudaFree(C_dev);
+    cudaMemcpy(C_host, g_C, sizeC, cudaMemcpyDeviceToHost);
 }
 
 } // extern "C"
