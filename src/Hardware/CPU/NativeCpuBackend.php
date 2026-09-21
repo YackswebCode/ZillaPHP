@@ -69,24 +69,37 @@ final class NativeCpuBackend extends CpuBackend
     // Buffer conversion helpers
     // ==================================================================
 
-    /** @param array<int|float|bool> $arr */
+    /**
+     * Copy a PHP array of numbers into a freshly allocated C float array.
+     *
+     * Writes element-by-element through FFI's accessor rather than using
+     * pack('f*', ...$arr) — the spread operator is O(n²) in PHP for large
+     * arrays and dominates runtime on multi-hundred-KB tensors.
+     *
+     * @param array<int|float|bool> $arr
+     */
     private function toC(array $arr): CData
     {
-        $n      = count($arr);
-        $buf    = $this->ffi->new("float[{$n}]");
-        $floats = array_map('floatval', $arr);
-        $packed = pack('f*', ...$floats);
-        FFI::memcpy($buf, $packed, $n * 4);
+        $n   = count($arr);
+        $buf = $this->ffi->new("float[{$n}]");
+        for ($i = 0; $i < $n; $i++) {
+            $buf[$i] = (float) $arr[$i];
+        }
         return $buf;
     }
 
-    /** @return float[] */
+    /**
+     * Read a C float array back into a PHP array.
+     *
+     * @return float[]
+     */
     private function fromC(CData $buf, int $n): array
     {
-        $binary = FFI::string($buf, $n * 4);
-        /** @var array<int,float> $unpacked */
-        $unpacked = unpack('f*', $binary);
-        return array_values($unpacked);
+        $arr = [];
+        for ($i = 0; $i < $n; $i++) {
+            $arr[] = $buf[$i];
+        }
+        return $arr;
     }
 
     // ==================================================================
