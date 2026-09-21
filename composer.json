@@ -1,0 +1,30 @@
+{
+    "name": "zillaphp/zillaphp",
+    "description": "A PHP-native framework for machine learning and artificial intelligence",
+    "type": "library",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "Yahaya Ibrahim Yacksweb",
+            "email": "you@example.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "ZillaPHP\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "ZillaPHP\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
