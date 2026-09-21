@@ -7,3 +7,9 @@ composer.lock
 # CUDA compiled artifacts
 native/cuda/*.so
 native/cuda/*.o
+native/cpu/*.so
+logs/
+checkpoints/
+data/
+.phpunit.cache/
+composer.phar
