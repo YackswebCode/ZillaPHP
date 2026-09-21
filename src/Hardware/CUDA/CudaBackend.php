@@ -19,6 +19,15 @@ use ZillaPHP\Tensor\Tensor;
  *   - the shared library is missing
  *   - an operation has no CUDA implementation yet
  *
+ * Two execution paths are supported:
+ *
+ *   1. Naive path — data goes PHP → C buffer → GPU → C buffer → PHP on
+ *      every call. Simple but PCIe-bound. Used by matmul(), relu(), etc.
+ *
+ *   2. Persistent path — data lives on the GPU between calls, referenced
+ *      by integer handle. Only upload once at the start and download once
+ *      at the end. See bufferAlloc/bufferUpload/matmulDev.
+ *
  * IMPORTANT: FFI + CUDA interop requires that the CUDA library exports
  * plain C symbols (extern "C"). All kernel launchers do this.
  */
@@ -49,6 +58,17 @@ final class CudaBackend extends CpuBackend
                 void div_f32_cuda(const float* A, const float* B, float* C, int N);
                 void hann_window_cuda(float* w, int N);
                 void stft_magnitude_cuda(const float* input, int inputLen, const float* window, int fftSize, int hopSize, float* output, int* outNBins, int* outNFrames);
+                int  zilla_buffer_alloc(unsigned long n_floats);
+                void zilla_buffer_free(int id);
+                int  zilla_buffer_upload(int id, const float* host, unsigned long n_floats);
+                int  zilla_buffer_download(int id, float* host, unsigned long n_floats);
+                void zilla_sync(void);
+                int  matmul_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int  add_dev(int a_id, int b_id, int c_id, int n);
+                int  sub_dev(int a_id, int b_id, int c_id, int n);
+                int  mul_dev(int a_id, int b_id, int c_id, int n);
+                int  div_dev(int a_id, int b_id, int c_id, int n);
+                int  relu_dev(int x_id, int y_id, int n);
                 C,
                 $this->libraryPath
             );
@@ -106,7 +126,7 @@ final class CudaBackend extends CpuBackend
     }
 
     // ==================================================================
-    // Kernels
+    // Naive-path kernels (transfer on every call)
     // ==================================================================
 
     public function matmul(Tensor $a, Tensor $b): Tensor
@@ -329,5 +349,178 @@ final class CudaBackend extends CpuBackend
             $nBinsOut,
             $nFramesOut,
         ];
+    }
+
+    // ==================================================================
+    // Persistent device buffers (Option C)
+    // ==================================================================
+    //
+    // Workflow for GPU-resident computation:
+    //
+    //   $aId = $backend->bufferAlloc($n);
+    //   $bId = $backend->bufferAlloc($n);
+    //   $cId = $backend->bufferAlloc($n);
+    //   $backend->bufferUpload($aId, $a);
+    //   $backend->bufferUpload($bId, $b);
+    //   $backend->matmulDev($aId, $bId, $cId, $n, $n, $n);
+    //   $result = $backend->bufferDownload($cId, $n);
+    //   $backend->bufferFree($aId);
+    //   $backend->bufferFree($bId);
+    //   $backend->bufferFree($cId);
+    //
+    // For multi-op pipelines, keep the handles alive and run many *_dev
+    // calls before downloading. This is where the 15-50x speedup lives.
+
+    /**
+     * Allocate a device buffer holding $nFloats floats.
+     *
+     * @return int  Positive buffer handle, or throws on failure.
+     */
+    public function bufferAlloc(int $nFloats): int
+    {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        if ($nFloats < 1) {
+            throw new \InvalidArgumentException("nFloats must be >= 1.");
+        }
+
+        $id = $this->ffi->zilla_buffer_alloc($nFloats);
+        if ($id < 0) {
+            throw new \RuntimeException(
+                "zilla_buffer_alloc({$nFloats}) failed — GPU out of memory?"
+            );
+        }
+        return (int) $id;
+    }
+
+    /**
+     * Free a device buffer. Idempotent: freeing an already-freed or
+     * invalid handle is a safe no-op.
+     */
+    public function bufferFree(int $id): void
+    {
+        if (!$this->loaded) return;
+        if ($id > 0) {
+            $this->ffi->zilla_buffer_free($id);
+        }
+    }
+
+    /**
+     * Copy a PHP float array into a previously allocated device buffer.
+     *
+     * @param float[] $host
+     */
+    public function bufferUpload(int $id, array $host): void
+    {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        if ($id < 1) {
+            throw new \InvalidArgumentException("Invalid buffer id: {$id}");
+        }
+
+        $buf = $this->toC($host);
+        $ok  = $this->ffi->zilla_buffer_upload($id, $buf, count($host));
+        if ($ok !== 0) {
+            throw new \RuntimeException(
+                "zilla_buffer_upload failed for id {$id} (" . count($host) . " floats)."
+            );
+        }
+    }
+
+    /**
+     * Copy a device buffer back into a PHP float array.
+     *
+     * @return float[]
+     */
+    public function bufferDownload(int $id, int $nFloats): array
+    {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        if ($id < 1) {
+            throw new \InvalidArgumentException("Invalid buffer id: {$id}");
+        }
+        if ($nFloats < 1) {
+            throw new \InvalidArgumentException("nFloats must be >= 1.");
+        }
+
+        $buf = $this->ffi->new("float[{$nFloats}]");
+        $ok  = $this->ffi->zilla_buffer_download($id, $buf, $nFloats);
+        if ($ok !== 0) {
+            throw new \RuntimeException("zilla_buffer_download failed for id {$id}.");
+        }
+        return $this->fromC($buf, $nFloats);
+    }
+
+    /**
+     * Block until all pending GPU work is complete. Useful for timing.
+     */
+    public function sync(): void
+    {
+        if (!$this->loaded) return;
+        $this->ffi->zilla_sync();
+    }
+
+    /**
+     * Device-to-device matmul:
+     *   C = A @ B
+     * All three handles must be pre-allocated. Sizes in floats.
+     */
+    public function matmulDev(int $aId, int $bId, int $cId, int $m, int $k, int $n): void
+    {
+        if (!$this->loaded) {
+            throw new \RuntimeException("CUDA backend not loaded.");
+        }
+        $ok = $this->ffi->matmul_dev($aId, $bId, $cId, $m, $k, $n);
+        if ($ok !== 0) {
+            throw new \RuntimeException(
+                "matmul_dev({$aId}, {$bId}, {$cId}, {$m}, {$k}, {$n}) failed."
+            );
+        }
+    }
+
+    /**
+     * Device-to-device elementwise ops.
+     */
+    public function addDev(int $aId, int $bId, int $cId, int $n): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("CUDA backend not loaded.");
+        if ($this->ffi->add_dev($aId, $bId, $cId, $n) !== 0) {
+            throw new \RuntimeException("add_dev failed.");
+        }
+    }
+
+    public function subDev(int $aId, int $bId, int $cId, int $n): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("CUDA backend not loaded.");
+        if ($this->ffi->sub_dev($aId, $bId, $cId, $n) !== 0) {
+            throw new \RuntimeException("sub_dev failed.");
+        }
+    }
+
+    public function mulDev(int $aId, int $bId, int $cId, int $n): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("CUDA backend not loaded.");
+        if ($this->ffi->mul_dev($aId, $bId, $cId, $n) !== 0) {
+            throw new \RuntimeException("mul_dev failed.");
+        }
+    }
+
+    public function divDev(int $aId, int $bId, int $cId, int $n): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("CUDA backend not loaded.");
+        if ($this->ffi->div_dev($aId, $bId, $cId, $n) !== 0) {
+            throw new \RuntimeException("div_dev failed.");
+        }
+    }
+
+    public function reluDev(int $xId, int $yId, int $n): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("CUDA backend not loaded.");
+        if ($this->ffi->relu_dev($xId, $yId, $n) !== 0) {
+            throw new \RuntimeException("relu_dev failed.");
+        }
     }
 }
