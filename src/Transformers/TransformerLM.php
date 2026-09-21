@@ -10,12 +10,6 @@ use ZillaPHP\NN\Layers\Linear;
 use ZillaPHP\NN\Module;
 use ZillaPHP\Tensor\Tensor;
 
-/**
- * A small autoregressive language model.
- *
- *   input : Tensor [T]        integer token ids
- *   output: Tensor [T, vocab] logits for next token at each position
- */
 final class TransformerLM extends Module
 {
     private Embedding $tokenEmbed;
@@ -54,14 +48,12 @@ final class TransformerLM extends Module
             );
         }
 
-        // Token + positional embeddings — [T, dim]
         $x = $this->tokenEmbed->forward($tokens);
 
         $positions = Tensor::fromArray(range(0, $T - 1));
         $pos = $this->posEmbed->forward($positions);
         $x = $x->add($pos);
 
-        // Causal mask — [T, T]
         $mask = Tensor::causalMask($T);
 
         foreach ($this->blocks as $block) {
@@ -69,7 +61,47 @@ final class TransformerLM extends Module
         }
 
         $x = $this->lnFinal->forward($x);
-        return $this->head->forward($x);   // [T, vocab]
+        return $this->head->forward($x);
+    }
+
+    /**
+     * Forward pass with KV cache for autoregressive generation.
+     *
+     * @param Tensor  $tokens  Full prompt [T] on first call, or [1] on subsequent calls.
+     * @param KVCache $cache   In/out cache object.
+     */
+    public function forwardWithCache(Tensor $tokens, KVCache $cache): Tensor
+    {
+        $T      = $tokens->shape()->dims()[0];
+        $offset = $cache->length;
+
+        if ($offset + $T > $this->maxSeqLen) {
+            throw new \RuntimeException(
+                "Sequence position " . ($offset + $T) . " exceeds max {$this->maxSeqLen}."
+            );
+        }
+
+        $x = $this->tokenEmbed->forward($tokens);
+
+        $positions = Tensor::fromArray(array_map('floatval', range($offset, $offset + $T - 1)));
+        $pos = $this->posEmbed->forward($positions);
+        $x = $x->add($pos);
+
+        foreach ($this->blocks as $i => $block) {
+            $layerCache = $cache->layers[$i] ?? null;
+            $x = $block->forwardWithCache($x, $layerCache);
+            $cache->layers[$i] = $layerCache;
+        }
+
+        $cache->length += $T;
+
+        $x = $this->lnFinal->forward($x);
+        return $this->head->forward($x);
+    }
+
+    public function newCache(): KVCache
+    {
+        return new KVCache(count($this->blocks));
     }
 
     /** @return \ZillaPHP\NN\Parameter[] */

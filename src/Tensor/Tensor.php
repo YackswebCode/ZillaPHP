@@ -25,6 +25,8 @@ class Tensor
     protected $backwardFn = null;
     protected string $op = '';
 
+    private static int $noGradDepth = 0;
+
     /** @param array<int|float|bool> $data */
     public function __construct(
         array $data,
@@ -43,6 +45,25 @@ class Tensor
         $this->dtype        = $dtype;
         $this->device       = $device ?? Device::cpu();
         $this->requiresGrad = $requiresGrad;
+    }
+
+    // ==================================================================
+    // No-grad mode
+    // ==================================================================
+
+    public static function noGrad(callable $fn): mixed
+    {
+        self::$noGradDepth++;
+        try {
+            return $fn();
+        } finally {
+            self::$noGradDepth--;
+        }
+    }
+
+    public static function gradEnabled(): bool
+    {
+        return self::$noGradDepth === 0;
     }
 
     // ==================================================================
@@ -88,8 +109,6 @@ class Tensor
 
     /**
      * Stack an array of [1, D] tensors into a single [N, D] tensor.
-     * This is what lets us train on batches: many samples become one
-     * matmul of shape [N, D] @ [D, out] instead of N separate matmuls.
      *
      * @param Tensor[] $tensors
      */
@@ -122,168 +141,40 @@ class Tensor
     }
 
     /**
-     * Reshape without changing data. Total element count must match.
-     *
-     * @param int[] $newShape
-     */
-    public function reshape(array $newShape): self
-    {
-        $target = 1;
-        foreach ($newShape as $d) $target *= $d;
-        if ($target !== $this->shape->size()) {
-            throw new \InvalidArgumentException(
-                "Cannot reshape from {$this->shape} to [" . implode(',', $newShape) .
-                "] — element count {$target} vs {$this->shape->size()}"
-            );
-        }
-        return new self($this->data, new Shape($newShape), $this->dtype, $this->device);
-    }
-
-    /**
-     * Extract a contiguous slice of rows from a 2D tensor.
-     * Returns rows [$start, $end).
-     */
-    public function sliceRows(int $start, int $end): self
-    {
-        $dims = $this->shape->dims();
-        if (count($dims) !== 2) {
-            throw new \RuntimeException("sliceRows requires 2D tensor.");
-        }
-        [$rows, $cols] = $dims;
-        if ($start < 0 || $end > $rows || $start >= $end) {
-            throw new \OutOfRangeException(
-                "Invalid slice [{$start}, {$end}) for tensor with {$rows} rows."
-            );
-        }
-
-        $out = [];
-        for ($i = $start; $i < $end; $i++) {
-            for ($j = 0; $j < $cols; $j++) {
-                $out[] = $this->data[$i * $cols + $j];
-            }
-        }
-
-        return new self($out, new Shape([$end - $start, $cols]), $this->dtype, $this->device);
-    }
-
-    /**
-     * Split a 2D [rows, cols] tensor into $n chunks along the columns,
-     * returning $n tensors of shape [rows, cols / n].
-     *
-     * Gradients from each chunk scatter back into the source tensor.
-     *
-     * @return Tensor[]
-     */
-    public function chunkColumns(int $n): array
-    {
-        $dims = $this->shape->dims();
-        if (count($dims) !== 2) throw new \RuntimeException("chunkColumns requires 2D tensor.");
-        [$rows, $cols] = $dims;
-        if ($cols % $n !== 0) {
-            throw new \InvalidArgumentException(
-                "Cannot split {$cols} columns into {$n} equal chunks."
-            );
-        }
-        $chunkSize = intdiv($cols, $n);
-        $out = [];
-
-        for ($c = 0; $c < $n; $c++) {
-            $piece = [];
-            for ($i = 0; $i < $rows; $i++) {
-                for ($j = 0; $j < $chunkSize; $j++) {
-                    $piece[] = $this->data[$i * $cols + $c * $chunkSize + $j];
-                }
-            }
-            $chunk = new self($piece, new Shape([$rows, $chunkSize]), $this->dtype, $this->device);
-
-            if ($this->requiresGrad) {
-                $source = $this;
-                $chunkC = $c;
-                Tensor::attachAutograd(
-                    $chunk,
-                    [$this],
-                    "chunk_columns_{$c}",
-                    function (Tensor $g) use ($source, $chunkC, $chunkSize, $cols, $rows): void {
-                        $full = array_fill(0, $rows * $cols, 0.0);
-                        $gd = $g->data();
-                        for ($i = 0; $i < $rows; $i++) {
-                            for ($j = 0; $j < $chunkSize; $j++) {
-                                $full[$i * $cols + $chunkC * $chunkSize + $j] = $gd[$i * $chunkSize + $j];
-                            }
-                        }
-                        $source->accumulateGradPublic(new self($full, $source->shape()));
-                    },
-                );
-            }
-            $out[] = $chunk;
-        }
-        return $out;
-    }
-
-    /**
-     * Concatenate N tensors along columns. All must have the same row count.
-     * Gradients from the output split back into the corresponding inputs.
+     * Concatenate N 2D tensors of shape [N_i, D] along axis 0.
+     * Result is [sum(N_i), D]. Used to grow a KV cache.
      *
      * @param Tensor[] $tensors
      */
-    public static function concatColumns(array $tensors): self
+    public static function concatAlongRows(array $tensors): self
     {
-        if (empty($tensors)) throw new \InvalidArgumentException("concatColumns requires tensors.");
-        $rows = $tensors[0]->shape()->dims()[0] ?? 0;
-        $colsTotal = 0;
-        $colWidths = [];
+        if (empty($tensors)) {
+            throw new \InvalidArgumentException("concatAlongRows requires tensors.");
+        }
+
+        $first = $tensors[0]->shape()->dims();
+        if (count($first) !== 2) {
+            throw new \RuntimeException("concatAlongRows requires 2D tensors.");
+        }
+        $cols = $first[1];
+
+        $rowsTotal = 0;
         foreach ($tensors as $t) {
-            if ($t->shape()->dims()[0] !== $rows) {
-                throw new \InvalidArgumentException("concatColumns: row count mismatch.");
+            $td = $t->shape()->dims();
+            if (count($td) !== 2 || $td[1] !== $cols) {
+                throw new \InvalidArgumentException("concatAlongRows: column mismatch.");
             }
-            $cw = $t->shape()->dims()[1];
-            $colWidths[] = $cw;
-            $colsTotal += $cw;
+            $rowsTotal += $td[0];
         }
 
         $out = [];
-        for ($i = 0; $i < $rows; $i++) {
-            foreach ($tensors as $t) {
-                $td = $t->data();
-                $cw = $t->shape()->dims()[1];
-                for ($j = 0; $j < $cw; $j++) {
-                    $out[] = $td[$i * $cw + $j];
-                }
+        foreach ($tensors as $t) {
+            foreach ($t->data() as $v) {
+                $out[] = $v;
             }
         }
 
-        $result = new self($out, new Shape([$rows, $colsTotal]));
-
-        $anyGrad = false;
-        foreach ($tensors as $t) {
-            if ($t->requiresGrad) { $anyGrad = true; break; }
-        }
-
-        if ($anyGrad) {
-            Tensor::attachAutograd(
-                $result,
-                $tensors,
-                'concat_columns',
-                function (Tensor $g) use ($tensors, $rows, $colsTotal, $colWidths): void {
-                    $gd = $g->data();
-                    $colOffset = 0;
-                    foreach ($tensors as $idx => $t) {
-                        $cw = $colWidths[$idx];
-                        if ($t->requiresGrad) {
-                            $part = [];
-                            for ($i = 0; $i < $rows; $i++) {
-                                for ($j = 0; $j < $cw; $j++) {
-                                    $part[] = $gd[$i * $colsTotal + $colOffset + $j];
-                                }
-                            }
-                            $t->accumulateGradPublic(new self($part, $t->shape()));
-                        }
-                        $colOffset += $cw;
-                    }
-                },
-            );
-        }
-        return $result;
+        return new self($out, new Shape([$rowsTotal, $cols]));
     }
 
     /** @param array<mixed> $data @param array<int|float|bool> $flat @return int[] */
@@ -307,174 +198,6 @@ class Tensor
             elseif ($sub !== $cs) throw new \InvalidArgumentException('Ragged arrays are not supported.');
         }
         return array_merge([$count], $sub ?? []);
-    }
-
-    /**
-     * Replace elements where $mask is 1.0 with a constant value.
-     * Used to apply causal attention masks before softmax.
-     *
-     * gradient: mask is a constant, so grad_in = g * (1 - mask).
-     */
-    public function maskedFill(Tensor $mask, float $value = -1e9): self
-    {
-        if ($mask->shape()->dims() !== $this->shape->dims()) {
-            throw new \InvalidArgumentException(
-                "maskedFill: mask shape {$mask->shape()} must match tensor shape {$this->shape}"
-            );
-        }
-        $n   = $this->shape->size();
-        $m   = $mask->data();
-        $out = [];
-        for ($i = 0; $i < $n; $i++) {
-            $out[] = $m[$i] > 0.5 ? $value : $this->data[$i];
-        }
-
-        $result = new self($out, $this->shape, $this->dtype, $this->device);
-        if ($this->requiresGrad) {
-            $result->requiresGrad = true;
-            $result->op = 'masked_fill';
-            $result->inputs = [$this];
-            $result->backwardFn = function (Tensor $g) use ($result, $mask): void {
-                $a  = $result->inputs[0];
-                $gd = $g->data();
-                $md = $mask->data();
-                $out = [];
-                foreach ($gd as $i => $v) $out[] = $md[$i] > 0.5 ? 0.0 : $v;
-                $a->accumulateGrad(new self($out, $g->shape()));
-            };
-        }
-        return $result;
-    }
-
-        /**
-     * Layer normalization over the last dimension.
-     *
-     *   input : Tensor [rows, dim]
-     *   gamma : Tensor [dim]     (learnable scale)
-     *   beta  : Tensor [dim]     (learnable shift)
-     *
-     *   y = (x - mean) / sqrt(var + eps) * gamma + beta
-     *
-     * Backward uses the standard closed-form gradient of layernorm.
-     */
-    public function layerNorm(Tensor $gamma, Tensor $beta, float $eps = 1e-5): self
-    {
-        $dims = $this->shape->dims();
-        if (count($dims) !== 2) {
-            throw new \RuntimeException("layerNorm requires 2D input.");
-        }
-        [$rows, $dim] = $dims;
-
-        if ($gamma->shape()->dims() !== [$dim] || $beta->shape()->dims() !== [$dim]) {
-            throw new \InvalidArgumentException("gamma and beta must have shape [{$dim}].");
-        }
-
-        $d  = $this->data();
-        $gd = $gamma->data();
-        $bd = $beta->data();
-
-        $means   = [];
-        $invStds = [];
-        $xhats   = [];
-        $out     = [];
-
-        for ($i = 0; $i < $rows; $i++) {
-            $offset = $i * $dim;
-
-            $mean = 0.0;
-            for ($j = 0; $j < $dim; $j++) $mean += $d[$offset + $j];
-            $mean /= $dim;
-
-            $var = 0.0;
-            for ($j = 0; $j < $dim; $j++) {
-                $diff = $d[$offset + $j] - $mean;
-                $var += $diff * $diff;
-            }
-            $var /= $dim;
-            $invStd = 1.0 / sqrt($var + $eps);
-
-            $means[$i]   = $mean;
-            $invStds[$i] = $invStd;
-
-            for ($j = 0; $j < $dim; $j++) {
-                $xhat = ($d[$offset + $j] - $mean) * $invStd;
-                $xhats[$offset + $j] = $xhat;
-                $out[] = $xhat * $gd[$j] + $bd[$j];
-            }
-        }
-
-        $result = new self($out, $this->shape, $this->dtype, $this->device);
-
-        if ($this->requiresGrad || $gamma->requiresGrad || $beta->requiresGrad) {
-            self::attachAutograd(
-                $result,
-                [$this, $gamma, $beta],
-                'layer_norm',
-                function (Tensor $g) use ($result, $gd, $xhats, $invStds, $rows, $dim): void {
-                    [$input, $gamma, $beta] = $result->inputs;
-                    $gData = $g->data();
-
-                    $gradGamma = array_fill(0, $dim, 0.0);
-                    $gradBeta  = array_fill(0, $dim, 0.0);
-                    $gradInput = array_fill(0, $rows * $dim, 0.0);
-
-                    for ($i = 0; $i < $rows; $i++) {
-                        $offset = $i * $dim;
-                        $invStd = $invStds[$i];
-
-                        $sumGxhat     = 0.0;
-                        $sumGxhatXhat = 0.0;
-                        $gxhat        = [];
-
-                        for ($j = 0; $j < $dim; $j++) {
-                            $gxhat[$j] = $gData[$offset + $j] * $gd[$j];
-                            $xhat      = $xhats[$offset + $j];
-
-                            $gradGamma[$j] += $gData[$offset + $j] * $xhat;
-                            $gradBeta[$j]  += $gData[$offset + $j];
-
-                            $sumGxhat     += $gxhat[$j];
-                            $sumGxhatXhat += $gxhat[$j] * $xhat;
-                        }
-
-                        for ($j = 0; $j < $dim; $j++) {
-                            $xhat = $xhats[$offset + $j];
-                            $gradInput[$offset + $j] = $invStd / $dim * (
-                                $dim * $gxhat[$j] - $sumGxhat - $xhat * $sumGxhatXhat
-                            );
-                        }
-                    }
-
-                    if ($input->requiresGrad) {
-                        $input->accumulateGradPublic(new self($gradInput, $input->shape()));
-                    }
-                    if ($gamma->requiresGrad) {
-                        $gamma->accumulateGradPublic(new self($gradGamma, $gamma->shape()));
-                    }
-                    if ($beta->requiresGrad) {
-                        $beta->accumulateGradPublic(new self($gradBeta, $beta->shape()));
-                    }
-                },
-            );
-        }
-
-        return $result;
-    }
-
-    /**
-     * Build a causal (upper-triangular) mask of shape [size, size].
-     * mask[i][j] = $above if j > i, else 0.
-     * Used to prevent attention from looking at future tokens.
-     */
-    public static function causalMask(int $size, float $above = 1.0): self
-    {
-        $data = [];
-        for ($i = 0; $i < $size; $i++) {
-            for ($j = 0; $j < $size; $j++) {
-                $data[] = ($j > $i) ? $above : 0.0;
-            }
-        }
-        return new self($data, new Shape([$size, $size]));
     }
 
     // ==================================================================
@@ -512,14 +235,10 @@ class Tensor
     }
 
     // ==================================================================
-    // Autograd registration (used by losses and external operators)
+    // Autograd registration
     // ==================================================================
 
     /**
-     * Attach autograd metadata to a freshly-constructed result tensor.
-     * Intended for loss functions and custom operators that need to hook
-     * into the reverse-mode graph without touching protected state.
-     *
      * @param Tensor[] $inputs
      */
     public static function attachAutograd(
@@ -528,6 +247,9 @@ class Tensor
         string $op,
         callable $backwardFn,
     ): Tensor {
+        if (!self::gradEnabled()) {
+            return $result;
+        }
         $result->requiresGrad = true;
         $result->op           = $op;
         $result->inputs       = $inputs;
@@ -535,10 +257,6 @@ class Tensor
         return $result;
     }
 
-    /**
-     * Public bridge to the protected `accumulateGrad`, for use by external
-     * backward closures (losses, custom ops, etc.).
-     */
     public function accumulateGradPublic(Tensor $g): void
     {
         $this->accumulateGrad($g);
@@ -674,15 +392,316 @@ class Tensor
     }
 
     // ==================================================================
+    // Shape manipulation with autograd
+    // ==================================================================
+
+    public function reshape(array $newShape): self
+    {
+        $target = 1;
+        foreach ($newShape as $d) $target *= $d;
+        if ($target !== $this->shape->size()) {
+            throw new \InvalidArgumentException(
+                "Cannot reshape from {$this->shape} to [" . implode(',', $newShape) .
+                "] — element count {$target} vs {$this->shape->size()}"
+            );
+        }
+        return new self($this->data, new Shape($newShape), $this->dtype, $this->device);
+    }
+
+    public function sliceRows(int $start, int $end): self
+    {
+        $dims = $this->shape->dims();
+        if (count($dims) !== 2) {
+            throw new \RuntimeException("sliceRows requires 2D tensor.");
+        }
+        [$rows, $cols] = $dims;
+        if ($start < 0 || $end > $rows || $start >= $end) {
+            throw new \OutOfRangeException(
+                "Invalid slice [{$start}, {$end}) for tensor with {$rows} rows."
+            );
+        }
+
+        $out = [];
+        for ($i = $start; $i < $end; $i++) {
+            for ($j = 0; $j < $cols; $j++) {
+                $out[] = $this->data[$i * $cols + $j];
+            }
+        }
+
+        return new self($out, new Shape([$end - $start, $cols]), $this->dtype, $this->device);
+    }
+
+    /**
+     * @return Tensor[]
+     */
+    public function chunkColumns(int $n): array
+    {
+        $dims = $this->shape->dims();
+        if (count($dims) !== 2) throw new \RuntimeException("chunkColumns requires 2D tensor.");
+        [$rows, $cols] = $dims;
+        if ($cols % $n !== 0) {
+            throw new \InvalidArgumentException(
+                "Cannot split {$cols} columns into {$n} equal chunks."
+            );
+        }
+        $chunkSize = intdiv($cols, $n);
+        $out = [];
+
+        for ($c = 0; $c < $n; $c++) {
+            $piece = [];
+            for ($i = 0; $i < $rows; $i++) {
+                for ($j = 0; $j < $chunkSize; $j++) {
+                    $piece[] = $this->data[$i * $cols + $c * $chunkSize + $j];
+                }
+            }
+            $chunk = new self($piece, new Shape([$rows, $chunkSize]), $this->dtype, $this->device);
+
+            if (self::gradEnabled() && $this->requiresGrad) {
+                $source = $this;
+                $chunkC = $c;
+                Tensor::attachAutograd(
+                    $chunk,
+                    [$this],
+                    "chunk_columns_{$c}",
+                    function (Tensor $g) use ($source, $chunkC, $chunkSize, $cols, $rows): void {
+                        $full = array_fill(0, $rows * $cols, 0.0);
+                        $gd = $g->data();
+                        for ($i = 0; $i < $rows; $i++) {
+                            for ($j = 0; $j < $chunkSize; $j++) {
+                                $full[$i * $cols + $chunkC * $chunkSize + $j] = $gd[$i * $chunkSize + $j];
+                            }
+                        }
+                        $source->accumulateGradPublic(new self($full, $source->shape()));
+                    },
+                );
+            }
+            $out[] = $chunk;
+        }
+        return $out;
+    }
+
+    /**
+     * @param Tensor[] $tensors
+     */
+    public static function concatColumns(array $tensors): self
+    {
+        if (empty($tensors)) throw new \InvalidArgumentException("concatColumns requires tensors.");
+        $rows = $tensors[0]->shape()->dims()[0] ?? 0;
+        $colsTotal = 0;
+        $colWidths = [];
+        foreach ($tensors as $t) {
+            if ($t->shape()->dims()[0] !== $rows) {
+                throw new \InvalidArgumentException("concatColumns: row count mismatch.");
+            }
+            $cw = $t->shape()->dims()[1];
+            $colWidths[] = $cw;
+            $colsTotal += $cw;
+        }
+
+        $out = [];
+        for ($i = 0; $i < $rows; $i++) {
+            foreach ($tensors as $t) {
+                $td = $t->data();
+                $cw = $t->shape()->dims()[1];
+                for ($j = 0; $j < $cw; $j++) {
+                    $out[] = $td[$i * $cw + $j];
+                }
+            }
+        }
+
+        $result = new self($out, new Shape([$rows, $colsTotal]));
+
+        if (self::gradEnabled()) {
+            $anyGrad = false;
+            foreach ($tensors as $t) {
+                if ($t->requiresGrad) { $anyGrad = true; break; }
+            }
+
+            if ($anyGrad) {
+                Tensor::attachAutograd(
+                    $result,
+                    $tensors,
+                    'concat_columns',
+                    function (Tensor $g) use ($tensors, $rows, $colsTotal, $colWidths): void {
+                        $gd = $g->data();
+                        $colOffset = 0;
+                        foreach ($tensors as $idx => $t) {
+                            $cw = $colWidths[$idx];
+                            if ($t->requiresGrad) {
+                                $part = [];
+                                for ($i = 0; $i < $rows; $i++) {
+                                    for ($j = 0; $j < $cw; $j++) {
+                                        $part[] = $gd[$i * $colsTotal + $colOffset + $j];
+                                    }
+                                }
+                                $t->accumulateGradPublic(new self($part, $t->shape()));
+                            }
+                            $colOffset += $cw;
+                        }
+                    },
+                );
+            }
+        }
+        return $result;
+    }
+
+    // ==================================================================
+    // Masking / LayerNorm
+    // ==================================================================
+
+    public function maskedFill(Tensor $mask, float $value = -1e9): self
+    {
+        if ($mask->shape()->dims() !== $this->shape->dims()) {
+            throw new \InvalidArgumentException(
+                "maskedFill: mask shape {$mask->shape()} must match tensor shape {$this->shape}"
+            );
+        }
+        $n   = $this->shape->size();
+        $m   = $mask->data();
+        $out = [];
+        for ($i = 0; $i < $n; $i++) {
+            $out[] = $m[$i] > 0.5 ? $value : $this->data[$i];
+        }
+
+        $result = new self($out, $this->shape, $this->dtype, $this->device);
+        if (self::gradEnabled() && $this->requiresGrad) {
+            $result->requiresGrad = true;
+            $result->op = 'masked_fill';
+            $result->inputs = [$this];
+            $result->backwardFn = function (Tensor $g) use ($result, $mask): void {
+                $a  = $result->inputs[0];
+                $gd = $g->data();
+                $md = $mask->data();
+                $out = [];
+                foreach ($gd as $i => $v) $out[] = $md[$i] > 0.5 ? 0.0 : $v;
+                $a->accumulateGrad(new self($out, $g->shape()));
+            };
+        }
+        return $result;
+    }
+
+    public static function causalMask(int $size, float $above = 1.0): self
+    {
+        $data = [];
+        for ($i = 0; $i < $size; $i++) {
+            for ($j = 0; $j < $size; $j++) {
+                $data[] = ($j > $i) ? $above : 0.0;
+            }
+        }
+        return new self($data, new Shape([$size, $size]));
+    }
+
+    public function layerNorm(Tensor $gamma, Tensor $beta, float $eps = 1e-5): self
+    {
+        $dims = $this->shape->dims();
+        if (count($dims) !== 2) {
+            throw new \RuntimeException("layerNorm requires 2D input.");
+        }
+        [$rows, $dim] = $dims;
+
+        if ($gamma->shape()->dims() !== [$dim] || $beta->shape()->dims() !== [$dim]) {
+            throw new \InvalidArgumentException("gamma and beta must have shape [{$dim}].");
+        }
+
+        $d  = $this->data();
+        $gd = $gamma->data();
+        $bd = $beta->data();
+
+        $invStds = [];
+        $xhats   = [];
+        $out     = [];
+
+        for ($i = 0; $i < $rows; $i++) {
+            $offset = $i * $dim;
+
+            $mean = 0.0;
+            for ($j = 0; $j < $dim; $j++) $mean += $d[$offset + $j];
+            $mean /= $dim;
+
+            $var = 0.0;
+            for ($j = 0; $j < $dim; $j++) {
+                $diff = $d[$offset + $j] - $mean;
+                $var += $diff * $diff;
+            }
+            $var /= $dim;
+            $invStd = 1.0 / sqrt($var + $eps);
+            $invStds[$i] = $invStd;
+
+            for ($j = 0; $j < $dim; $j++) {
+                $xhat = ($d[$offset + $j] - $mean) * $invStd;
+                $xhats[$offset + $j] = $xhat;
+                $out[] = $xhat * $gd[$j] + $bd[$j];
+            }
+        }
+
+        $result = new self($out, $this->shape, $this->dtype, $this->device);
+
+        if (self::gradEnabled()
+            && ($this->requiresGrad || $gamma->requiresGrad || $beta->requiresGrad)
+        ) {
+            self::attachAutograd(
+                $result,
+                [$this, $gamma, $beta],
+                'layer_norm',
+                function (Tensor $g) use ($result, $gd, $xhats, $invStds, $rows, $dim): void {
+                    [$input, $gamma, $beta] = $result->inputs;
+                    $gData = $g->data();
+
+                    $gradGamma = array_fill(0, $dim, 0.0);
+                    $gradBeta  = array_fill(0, $dim, 0.0);
+                    $gradInput = array_fill(0, $rows * $dim, 0.0);
+
+                    for ($i = 0; $i < $rows; $i++) {
+                        $offset = $i * $dim;
+                        $invStd = $invStds[$i];
+
+                        $sumGxhat     = 0.0;
+                        $sumGxhatXhat = 0.0;
+                        $gxhat        = [];
+
+                        for ($j = 0; $j < $dim; $j++) {
+                            $gxhat[$j] = $gData[$offset + $j] * $gd[$j];
+                            $xhat      = $xhats[$offset + $j];
+                            $gradGamma[$j] += $gData[$offset + $j] * $xhat;
+                            $gradBeta[$j]  += $gData[$offset + $j];
+                            $sumGxhat     += $gxhat[$j];
+                            $sumGxhatXhat += $gxhat[$j] * $xhat;
+                        }
+
+                        for ($j = 0; $j < $dim; $j++) {
+                            $xhat = $xhats[$offset + $j];
+                            $gradInput[$offset + $j] = $invStd / $dim * (
+                                $dim * $gxhat[$j] - $sumGxhat - $xhat * $sumGxhatXhat
+                            );
+                        }
+                    }
+
+                    if ($input->requiresGrad) {
+                        $input->accumulateGradPublic(new self($gradInput, $input->shape()));
+                    }
+                    if ($gamma->requiresGrad) {
+                        $gamma->accumulateGradPublic(new self($gradGamma, $gamma->shape()));
+                    }
+                    if ($beta->requiresGrad) {
+                        $beta->accumulateGradPublic(new self($gradBeta, $beta->shape()));
+                    }
+                },
+            );
+        }
+
+        return $result;
+    }
+
+    // ==================================================================
     // Differentiable ops with broadcasting
     // ==================================================================
 
-      private function binaryOp(
+    private function binaryOp(
         Tensor $other,
         string $opName,
-        callable $forward,   // fn(Tensor $A, Tensor $B): Tensor
-        callable $backwardA, // fn(Tensor $g, Tensor $A, Tensor $B, Tensor $result): Tensor
-        callable $backwardB, // fn(Tensor $g, Tensor $A, Tensor $B, Tensor $result): Tensor
+        callable $forward,
+        callable $backwardA,
+        callable $backwardB,
     ): Tensor {
         $aDims = $this->shape()->dims();
         $bDims = $other->shape()->dims();
@@ -693,7 +712,7 @@ class Tensor
 
         $result = $forward($aB, $bB);
 
-        if ($this->requiresGrad || $other->requiresGrad) {
+        if (self::gradEnabled() && ($this->requiresGrad || $other->requiresGrad)) {
             $result->requiresGrad = true;
             $result->op = $opName;
             $result->inputs = [$this, $other];
@@ -702,7 +721,6 @@ class Tensor
             ): void {
                 [$a, $b] = $result->inputs;
                 if ($a->requiresGrad) {
-                    // Use the broadcasted operands so backward op shapes match $g
                     $ga = $backwardA($g, $aB, $bB, $result);
                     $a->accumulateGrad(self::reduceGrad($ga, $aDims));
                 }
@@ -765,7 +783,7 @@ class Tensor
     public function matmul(Tensor $other): Tensor
     {
         $result = self::backend()->matmul($this, $other);
-        if ($this->requiresGrad || $other->requiresGrad) {
+        if (self::gradEnabled() && ($this->requiresGrad || $other->requiresGrad)) {
             $result->requiresGrad = true;
             $result->op = 'matmul';
             $result->inputs = [$this, $other];
@@ -792,7 +810,7 @@ class Tensor
             for ($i = 0; $i < $m; $i++)
                 $out[] = $d[$i * $n + $j];
         $result = new Tensor($out, new Shape([$n, $m]));
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true;
             $result->op = 'transpose';
             $result->inputs = [$this];
@@ -807,7 +825,7 @@ class Tensor
     public function sum(): Tensor
     {
         $result = self::backend()->sum($this);
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'sum'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];
@@ -820,7 +838,7 @@ class Tensor
     public function mean(): Tensor
     {
         $result = self::backend()->mean($this);
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'mean'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];
@@ -834,7 +852,7 @@ class Tensor
     public function relu(): Tensor
     {
         $result = self::backend()->relu($this);
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'relu'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];
@@ -850,7 +868,7 @@ class Tensor
     public function exp(): Tensor
     {
         $result = self::backend()->exp($this);
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'exp'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];
@@ -864,7 +882,7 @@ class Tensor
     public function log(): Tensor
     {
         $result = self::backend()->log($this);
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'log'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];
@@ -893,7 +911,7 @@ class Tensor
         }
 
         $result = new Tensor($y, $this->shape());
-        if ($this->requiresGrad) {
+        if (self::gradEnabled() && $this->requiresGrad) {
             $result->requiresGrad = true; $result->op = 'softmax'; $result->inputs = [$this];
             $result->backwardFn = function (Tensor $g) use ($result): void {
                 $a = $result->inputs[0];

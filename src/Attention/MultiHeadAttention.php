@@ -89,4 +89,50 @@ final class MultiHeadAttention extends Module
             $this->wo->parameters(),
         );
     }
+
+        /**
+     * Forward pass with a KV cache. Used during autoregressive generation.
+     *
+     * @param Tensor      $x      Input [T_new, dim], usually [1, dim] during generation.
+     * @param array|null  $cache  In/out: ['k' => Tensor, 'v' => Tensor] or null on first call.
+     */
+    public function forwardWithCache(Tensor $x, ?array &$cache): Tensor
+    {
+        $q     = $this->wq->forward($x);
+        $kNew  = $this->wk->forward($x);
+        $vNew  = $this->wv->forward($x);
+
+        if ($cache === null) {
+            $kFull = $kNew;
+            $vFull = $vNew;
+        } else {
+            $kFull = Tensor::concatAlongRows([$cache['k'], $kNew]);
+            $vFull = Tensor::concatAlongRows([$cache['v'], $vNew]);
+        }
+        $cache = ['k' => $kFull, 'v' => $vFull];
+
+        $qs = $q->chunkColumns($this->numHeads);
+        $ks = $kFull->chunkColumns($this->numHeads);
+        $vs = $vFull->chunkColumns($this->numHeads);
+
+        $outs = [];
+        for ($h = 0; $h < $this->numHeads; $h++) {
+            $outs[] = $this->attendHeadCached($qs[$h], $ks[$h], $vs[$h]);
+        }
+
+        $concat = Tensor::concatColumns($outs);
+        return $this->wo->forward($concat);
+    }
+
+    private function attendHeadCached(Tensor $q, Tensor $k, Tensor $v): Tensor
+    {
+        $headDim = $q->shape()->dims()[1];
+        $scale   = 1.0 / sqrt($headDim);
+
+        $scores = $q->matmul($k->transpose());
+        $scores = $scores->mul(Tensor::full([1], $scale));
+
+        $attn = $scores->softmax();
+        return $attn->matmul($v);
+    }
 }
