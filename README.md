@@ -487,6 +487,17 @@ Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
 
 Runs at **~40× real-time** on a 4-core Intel laptop.
 
+### GPU MNIST Training
+
+Full 60,000-sample MNIST, MLP (784 → 128 ReLU → 10), BATCH=64, Colab T4:
+
+| Path | Per epoch | Total (10 ep) | Test acc |
+|------|----------:|--------------:|---------:|
+| CPU (native C + OpenBLAS, Adam) | ~240 s | ~40 min | 98.05% |
+| **GPU v1 (persistent buffers, no bias, SGD)** | **27 s** | **4.5 min** | **93.31%** |
+| GPU v2 (planned — full device pipeline) | ~3 s | ~30 s | 95%+ |
+
+**v1 speedup: ~9× over CPU. v2 target: ~80×.**
 ---
 
 ## Audio Pipeline
