@@ -19,8 +19,8 @@ use ZillaPHP\Training\Trainer;
 
 Application::boot(native: true);
 
-$TRAIN_N = (int) (getenv('TRAIN_N') ?: 500);
-$TEST_N  = (int) (getenv('TEST_N')  ?: 200);
+$TRAIN_N = (int) (getenv('TRAIN_N') ?: 60000);
+$TEST_N  = (int) (getenv('TEST_N')  ?: 10000);
 $EPOCHS  = (int) (getenv('EPOCHS')  ?: 3);
 $LR      = (float) (getenv('LR')    ?: 0.001);
 
