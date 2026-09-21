@@ -44,8 +44,19 @@ final class Application
         printf("CPU cores      : %d\n", $this->cpuCores());
         printf("Memory limit   : %s\n", ini_get('memory_limit'));
         printf("FFI enabled    : %s\n", extension_loaded('FFI') ? 'yes' : 'no');
-        printf("Native lib     : %s\n",
+        printf("CPU lib        : %s\n",
             is_file(__DIR__ . '/../../native/cpu/libzilla_cpu.so') ? 'present' : 'not built');
+        printf("CUDA lib       : %s\n",
+            is_file(__DIR__ . '/../../native/cuda/libzilla_cuda.so') ? 'present' : 'not built');
+
+        $cudaAvailable = false;
+        if (is_file(__DIR__ . '/../../native/cuda/libzilla_cuda.so')) {
+            try {
+                $cuda = new \ZillaPHP\Hardware\CUDA\CudaBackend();
+                $cudaAvailable = $cuda->isCuda();
+            } catch (\Throwable) {}
+        }
+        printf("CUDA available : %s\n", $cudaAvailable ? 'yes' : 'no');
         echo "\nRecommended backend: CPU\n";
         return 0;
     }

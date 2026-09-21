@@ -61,12 +61,15 @@ final class Sampler
                 $next = $this->sampleFromLogits($lastRow, $temperature);
                 $ids[] = $next;
 
-                // ---- Stop if cache is full ----
-                if ($cache->length >= $this->maxContext) {
-                    // Sliding window: reset cache, re-encode last maxContext tokens
-                    $ids = array_slice($ids, -$this->maxContext);
-                    $cache = $this->model->newCache();
-                    $input = Tensor::fromArray(array_map('floatval', $ids));
+                // ---- Sliding window when cache would overflow ----
+                if ($cache->length + 1 > $this->maxContext) {
+                    // Keep only half the window so we get many fast steps
+                    // before the next reset.
+                    $keep = max(1, intdiv($this->maxContext, 2));
+                    $ids  = array_slice($ids, -$keep);
+
+                    $cache  = $this->model->newCache();
+                    $input  = Tensor::fromArray(array_map('floatval', $ids));
                     $logits = $this->model->forwardWithCache($input, $cache);
                     continue;
                 }
