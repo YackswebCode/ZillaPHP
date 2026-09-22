@@ -15,6 +15,14 @@ use ZillaPHP\Transformers\TransformerLM;
  * First step processes the full prompt and populates the cache.
  * Each subsequent step processes only the new token (1 forward step
  * on a [1, dim] input) using cached K/V from all previous positions.
+ *
+ * Two separate buffers are maintained:
+ *
+ *   $outputIds   — every token generated so far (for final decoding)
+ *   $workingIds  — the sliding context window (feeds the model)
+ *
+ * Truncating $workingIds when the cache fills up must NOT lose the
+ * tokens already emitted to the user.
  */
 final class Sampler
 {
@@ -39,47 +47,58 @@ final class Sampler
         }
 
         return Tensor::noGrad(function () use ($prompt, $maxNewTokens, $temperature) {
-            $ids   = $this->tokenizer->encode($prompt);
             $vocab = $this->tokenizer->vocabSize();
 
-            // Truncate prompt to maxContext
-            if (count($ids) > $this->maxContext) {
-                $ids = array_slice($ids, -$this->maxContext);
+            // ---- Prepare initial context ----
+            $promptIds = $this->tokenizer->encode($prompt);
+
+            // Truncate prompt if it exceeds the context window
+            if (count($promptIds) > $this->maxContext) {
+                $promptIds = array_slice($promptIds, -$this->maxContext);
             }
 
-            // ---- Initial pass: full prompt ----
-            $cache = $this->model->newCache();
-            $input = Tensor::fromArray(array_map('floatval', $ids));
+            // $outputIds accumulates EVERYTHING for the final decode.
+            // $workingIds is the sliding window that feeds the model.
+            $outputIds  = $promptIds;
+            $workingIds = $promptIds;
+
+            // ---- Initial forward pass over the prompt ----
+            $cache  = $this->model->newCache();
+            $input  = Tensor::fromArray(array_map('floatval', $workingIds));
             $logits = $this->model->forwardWithCache($input, $cache);
 
-            // ---- Generate tokens one at a time ----
+            // ---- Autoregressive loop ----
             for ($step = 0; $step < $maxNewTokens; $step++) {
-                $T = $logits->shape()->dims()[0];
+                $T   = $logits->shape()->dims()[0];
                 $all = $logits->data();
                 $lastRow = array_slice($all, ($T - 1) * $vocab, $vocab);
 
                 $next = $this->sampleFromLogits($lastRow, $temperature);
-                $ids[] = $next;
 
-                // ---- Sliding window when cache would overflow ----
+                // Append to BOTH buffers
+                $outputIds[]  = $next;   // never truncated
+                $workingIds[] = $next;   // may be truncated below
+
+                // ---- Sliding window when the cache would overflow ----
                 if ($cache->length + 1 > $this->maxContext) {
                     // Keep only half the window so we get many fast steps
                     // before the next reset.
                     $keep = max(1, intdiv($this->maxContext, 2));
-                    $ids  = array_slice($ids, -$keep);
+                    $workingIds = array_slice($workingIds, -$keep);
 
                     $cache  = $this->model->newCache();
-                    $input  = Tensor::fromArray(array_map('floatval', $ids));
+                    $input  = Tensor::fromArray(array_map('floatval', $workingIds));
                     $logits = $this->model->forwardWithCache($input, $cache);
                     continue;
                 }
 
                 // ---- Forward single new token ----
-                $input = Tensor::fromArray([(float) $next]);
+                $input  = Tensor::fromArray([(float) $next]);
                 $logits = $this->model->forwardWithCache($input, $cache);
             }
 
-            return $this->tokenizer->decode($ids);
+            // Decode the FULL history (prompt + every generated token)
+            return $this->tokenizer->decode($outputIds);
         });
     }
 
