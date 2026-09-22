@@ -60,9 +60,10 @@ final class SafeTensorsSerializer implements Serializer
             $offset += $bytes;
         }
 
-        // Metadata is stored in the header under the reserved __metadata__ key
-        if ($metadata !== null) {
-            $header['__metadata__'] = $metadata;
+        // Metadata is stored under the reserved __metadata__ key.
+        // The SafeTensors spec requires all values to be strings.
+        if ($metadata !== null && !empty($metadata)) {
+            $header['__metadata__'] = self::stringifyMetadata($metadata);
         }
 
         $headerJson  = json_encode($header, JSON_UNESCAPED_SLASHES);
@@ -87,6 +88,32 @@ final class SafeTensorsSerializer implements Serializer
         fwrite($fh, $headerJson);
         fwrite($fh, $dataBlob);
         fclose($fh);
+    }
+
+        /**
+     * SafeTensors requires __metadata__ values to be strings.
+     * Convert scalars (bool, int, float, null) to their string forms.
+     *
+     * @param array<string, mixed> $meta
+     * @return array<string, string>
+     */
+    private static function stringifyMetadata(array $meta): array
+    {
+        $out = [];
+        foreach ($meta as $k => $v) {
+            if (is_string($v)) {
+                $out[$k] = $v;
+            } elseif (is_bool($v)) {
+                $out[$k] = $v ? 'true' : 'false';
+            } elseif ($v === null) {
+                $out[$k] = '';
+            } elseif (is_scalar($v)) {
+                $out[$k] = (string) $v;
+            } else {
+                $out[$k] = json_encode($v, JSON_UNESCAPED_SLASHES);
+            }
+        }
+        return $out;
     }
 
     public function load(string $path): array
