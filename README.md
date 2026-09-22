@@ -771,10 +771,11 @@ PHP
 **Author:** Yahaya Ibrahim  
 **Organization:** Yacksweb Tech  
 **Country:** Nigeria
-```
 
-## License
+**License**
 
 **Apache-2.0** — see [`LICENSE`](LICENSE).
 
----
+```
+
+
