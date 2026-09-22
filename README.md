@@ -45,7 +45,7 @@ Build, train, and run neural networks directly from PHP — with a PHP-first API
 | **CPU-native MNIST training (60k samples, persistent)** | ✅ **96.86% in 52 s (77× vs old CPU)** |
 | CLI — `zilla doctor`, `zilla train`, `zilla generate:text` | ✅ Working |
 | Audio pipeline — WAV loader, Mel filterbank, log-mel | ✅ Working |
-| SafeTensors support | 🔜 Planned |
+| **SafeTensors support — HF-compatible** | ✅ **Working** |
 | MNIST CNN full training | 🚧 In progress |
 | CUDA Conv2D / MaxPool kernels | 🔜 Next |
 | Vision Transformer (ViT) | 🔜 Planned |
