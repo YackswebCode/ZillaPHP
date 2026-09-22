@@ -34,7 +34,8 @@ fi
 # shellcheck disable=SC2086
 gcc -O3 -march=native -ffast-math -shared -fPIC \
     $USE_OPENBLAS $OPENBLAS_CFLAGS \
-    -o libzilla_cpu.so zilla_cpu.c audio.c \
+    -o libzilla_cpu.so \
+    zilla_cpu.c audio.c buffer_registry.c training_ops.c \
     $OPENBLAS_LIBS \
     -lm
 

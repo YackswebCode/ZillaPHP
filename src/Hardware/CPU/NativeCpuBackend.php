@@ -46,6 +46,20 @@ final class NativeCpuBackend extends CpuBackend
                 void  hann_window_f32(float* w, int N);
                 void  fft_radix2_f32(float* re, float* im, int N);
                 void  stft_magnitude_f32(const float* input, int inputLen, const float* window, int fftSize, int hopSize, float* output, int* outNBins, int* outNFrames);
+                int   zilla_cpu_buffer_alloc(unsigned long n_floats);
+                void  zilla_cpu_buffer_free(int id);
+                int   zilla_cpu_buffer_upload(int id, const float* host, unsigned long n_floats);
+                int   zilla_cpu_buffer_download(int id, float* host, unsigned long n_floats);
+                int   matmul_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int   matmul_tn_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int   matmul_nt_dev(int a_id, int b_id, int c_id, int M, int K, int N);
+                int   add_bias_dev(int x_id, int b_id, int B, int C);
+                int   relu_fwd_dev(int x_id, int y_id, int mask_id, int n);
+                int   relu_bwd_dev(int dy_id, int mask_id, int dx_id, int n);
+                int   softmax_ce_dev(int logits_id, int targets_id, int dlogits_id, int loss_id, int B, int C);
+                int   bias_grad_dev(int dy_id, int db_id, int B, int C);
+                int   sgd_update_dev(int w_id, int dw_id, float lr, int n);
+                int   zero_dev(int id, int n);
                 C,
                 $this->libraryPath
             );
@@ -464,5 +478,114 @@ final class NativeCpuBackend extends CpuBackend
             $nBinsOut,
             $nFramesOut,
         ];
+    }
+
+    // ==================================================================
+    // Persistent CPU buffers (mirror of the CUDA API)
+    // ==================================================================
+
+    public function bufferAlloc(int $nFloats): int
+    {
+        if (!$this->loaded) throw new \RuntimeException("Native CPU backend not loaded.");
+        if ($nFloats < 1) throw new \InvalidArgumentException("nFloats must be >= 1.");
+        $id = $this->ffi->zilla_cpu_buffer_alloc($nFloats);
+        if ($id < 0) throw new \RuntimeException("zilla_cpu_buffer_alloc failed.");
+        return (int) $id;
+    }
+
+    public function bufferFree(int $id): void
+    {
+        if (!$this->loaded || $id < 1) return;
+        $this->ffi->zilla_cpu_buffer_free($id);
+    }
+
+    /** @param float[] $host */
+    public function bufferUpload(int $id, array $host): void
+    {
+        if (!$this->loaded) throw new \RuntimeException("Native CPU backend not loaded.");
+        $buf = $this->toC($host);
+        if ($this->ffi->zilla_cpu_buffer_upload($id, $buf, count($host)) !== 0) {
+            throw new \RuntimeException("buffer_upload failed for id {$id}.");
+        }
+    }
+
+    /** @return float[] */
+    public function bufferDownload(int $id, int $nFloats): array
+    {
+        if (!$this->loaded) throw new \RuntimeException("Native CPU backend not loaded.");
+        $buf = $this->ffi->new("float[{$nFloats}]");
+        if ($this->ffi->zilla_cpu_buffer_download($id, $buf, $nFloats) !== 0) {
+            throw new \RuntimeException("buffer_download failed for id {$id}.");
+        }
+        return $this->fromC($buf, $nFloats);
+    }
+
+    public function matmulDev(int $aId, int $bId, int $cId, int $M, int $K, int $N): void
+    {
+        if ($this->ffi->matmul_dev($aId, $bId, $cId, $M, $K, $N) !== 0)
+            throw new \RuntimeException("matmul_dev failed.");
+    }
+
+    public function matmulTnDev(int $aId, int $bId, int $cId, int $M, int $K, int $N): void
+    {
+        if ($this->ffi->matmul_tn_dev($aId, $bId, $cId, $M, $K, $N) !== 0)
+            throw new \RuntimeException("matmul_tn_dev failed.");
+    }
+
+    public function matmulNtDev(int $aId, int $bId, int $cId, int $M, int $K, int $N): void
+    {
+        if ($this->ffi->matmul_nt_dev($aId, $bId, $cId, $M, $K, $N) !== 0)
+            throw new \RuntimeException("matmul_nt_dev failed.");
+    }
+
+    public function addBiasDev(int $xId, int $bId, int $B, int $C): void
+    {
+        if ($this->ffi->add_bias_dev($xId, $bId, $B, $C) !== 0)
+            throw new \RuntimeException("add_bias_dev failed.");
+    }
+
+    public function reluFwdDev(int $xId, int $yId, int $maskId, int $n): void
+    {
+        if ($this->ffi->relu_fwd_dev($xId, $yId, $maskId, $n) !== 0)
+            throw new \RuntimeException("relu_fwd_dev failed.");
+    }
+
+    public function reluBwdDev(int $dyId, int $maskId, int $dxId, int $n): void
+    {
+        if ($this->ffi->relu_bwd_dev($dyId, $maskId, $dxId, $n) !== 0)
+            throw new \RuntimeException("relu_bwd_dev failed.");
+    }
+
+    public function softmaxCeDev(int $logitsId, int $targetsId, int $dlogitsId, int $lossId, int $B, int $C): void
+    {
+        if ($this->ffi->softmax_ce_dev($logitsId, $targetsId, $dlogitsId, $lossId, $B, $C) !== 0)
+            throw new \RuntimeException("softmax_ce_dev failed.");
+    }
+
+    public function biasGradDev(int $dyId, int $dbId, int $B, int $C): void
+    {
+        if ($this->ffi->bias_grad_dev($dyId, $dbId, $B, $C) !== 0)
+            throw new \RuntimeException("bias_grad_dev failed.");
+    }
+
+    public function sgdUpdateDev(int $wId, int $dwId, float $lr, int $n): void
+    {
+        if ($this->ffi->sgd_update_dev($wId, $dwId, $lr, $n) !== 0)
+            throw new \RuntimeException("sgd_update_dev failed.");
+    }
+
+    public function zeroDev(int $id, int $n): void
+    {
+        if ($this->ffi->zero_dev($id, $n) !== 0)
+            throw new \RuntimeException("zero_dev failed.");
+    }
+
+    /**
+     * No-op on CPU — all operations are synchronous.
+     * Provided for API compatibility with CudaBackend.
+     */
+    public function sync(): void
+    {
+        // Nothing to do — CPU compute completes before the call returns.
     }
 }
