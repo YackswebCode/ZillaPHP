@@ -1,3 +1,4 @@
+
 # ZillaPHP
 
 **A PHP-native framework for machine learning and artificial intelligence.**
@@ -38,13 +39,14 @@ Build, train, and run neural networks directly from PHP — with a PHP-first API
 | CUDA backend — matmul (cuBLAS) | ✅ Working |
 | CUDA backend — elementwise ops + ReLU | ✅ Working |
 | CUDA STFT (cuFFT) — audio feature extraction | ✅ Working |
-| **Persistent device tensors** | ✅ **Working (44× measured speedup)** |
+| **Persistent device tensors (GPU)** | ✅ **44× measured speedup** |
+| **Persistent CPU tensors** | ✅ **77× measured speedup — H0 rejected** |
 | **GPU-native MNIST training (60k samples)** | ✅ **96.85% in 23.5 s (100× vs CPU)** |
+| **CPU-native MNIST training (60k samples, persistent)** | ✅ **96.86% in 52 s (77× vs old CPU)** |
 | CLI — `zilla doctor`, `zilla train`, `zilla generate:text` | ✅ Working |
 | Audio pipeline — WAV loader, Mel filterbank, log-mel | ✅ Working |
 | SafeTensors support | 🔜 Planned |
 | MNIST CNN full training | 🚧 In progress |
-| GPU-native MNIST training (60k samples) | ✅ **96.85% in 23.5 s (100× vs CPU)** |
 | CUDA Conv2D / MaxPool kernels | 🔜 Next |
 | Vision Transformer (ViT) | 🔜 Planned |
 | Diffusion models | 🔜 Planned |
@@ -145,6 +147,7 @@ Backend Selection
 ### Native CPU Acceleration
 - C + OpenBLAS through PHP FFI
 - Matmul, elementwise, ReLU, Conv2D, MaxPool, STFT
+- **Persistent CPU buffers** — eliminate per-operation array ↔ C buffer conversion
 
 ### Audio Pipeline
 - **WAV loader** — 16-bit PCM mono/stereo, normalized to `[-1, 1]`
@@ -193,6 +196,21 @@ PHP array ← C buffer ← pinned ← GPU  (ONCE)
 | **Speedup** | | **44.2×** |
 
 This validates §13.9 of the project paper ("Large Operations and Amortization").
+
+### Persistent CPU Tensors
+
+The same architecture applied to CPU eliminates array ↔ C buffer conversion during training loops.
+
+**Measured effect** — full MNIST, 60,000 samples, MLP `784 → 128 → 10`, 10 epochs, SGD (lr=0.05), 4-core Intel laptop, single-threaded OpenBLAS:
+
+| Path | Per epoch | Total | Test accuracy |
+|------|----------:|------:|--------------:|
+| Naive (array conversion per op) | ~400 s | ~66 min | 98.05% |
+| **Persistent CPU buffers** | **5.2 s** | **52 s** | **96.86%** |
+
+**~77× speedup**, kernel unchanged. The entire gain comes from removing per-operation framework overhead.
+
+This is the empirical basis for rejecting the paper's null hypothesis **H0**.
 
 ---
 
@@ -402,6 +420,13 @@ php scripts/download_mnist.php
 php -d memory_limit=2G examples/mnist_full.php
 ```
 
+### Train MNIST on CPU with persistent tensors
+
+```bash
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
+    php -d memory_limit=3G examples/mnist_cpu_v2.php
+```
+
 ### Audio
 
 ```php
@@ -443,8 +468,48 @@ $tensor = $mel->fromWav($wav);   // [1, 64, nFrames]
 | Best test accuracy | **98.05%** |
 | Best epoch | 5 |
 | Early stopping | 8 |
-| Time per epoch (CPU) | ~7 min |
-| Total training time | **66.6 min** |
+| Time per epoch (CPU, naive) | ~7 min |
+| Total training time (CPU, naive) | **66.6 min** |
+
+---
+
+## MNIST on CPU — Persistent Tensors (H0 rejected)
+
+Full 60,000-sample MNIST, MLP `784 → 128 (ReLU) → 10`, batch=64, 10 epochs, SGD (lr=0.05).
+
+Hardware: Acer TravelMate, 4-core Intel, single-threaded OpenBLAS.
+
+| Path | Per epoch | Total | Test acc |
+|---|---:|---:|---:|
+| Old CPU (naive `toC`/`fromC` per op) | ~400 s | ~66 min | 98.05% |
+| **New CPU (persistent buffers)** | **5.2 s** | **52 s** | **96.86%** |
+| GPU v2 (T4 reference) | 2.4 s | 23.5 s | 96.85% |
+| PyTorch CPU (est., same hardware) | 2–4 s | 20–40 s | ~97% |
+
+### Speedup analysis
+
+The persistent-tensor architecture removes per-operation array ↔ C buffer conversion, dropping CPU training time from **~400 s/epoch** to **5.2 s/epoch** — a **~77× speedup**.
+
+The OpenBLAS kernel itself is unchanged. The entire gain comes from eliminating PHP framework overhead.
+
+This places ZillaPHP's CPU performance within **~2× of its own GPU path** and within **~1.5–2.5× of PyTorch CPU** on the same workload.
+
+### Reproduce
+
+```bash
+./native/cpu/build.sh
+
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
+    php -d memory_limit=3G examples/mnist_cpu_v2.php
+```
+
+### Research significance
+
+This measurement **rejects the paper's null hypothesis H0** for CPU-bound training:
+
+> *The overhead introduced by the PHP-first framework abstraction remains sufficiently large that ZillaPHP cannot achieve practically competitive performance on compute-intensive workloads.*
+
+The PHP-first abstraction imposes negligible cost once per-operation overhead is amortized, as predicted in §13.9 and §22.7 of the paper.
 
 ---
 
@@ -509,6 +574,8 @@ This result confirms the H1 hypothesis from the project paper:
 
 The 100× speedup is measured, not theoretical. The complete training pipeline — data loading, forward pass, backward pass, optimizer update, evaluation — runs from PHP, with the compute-intensive operations executing on the GPU through FFI.
 
+---
+
 ### Shakespeare Language Model
 
 Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
@@ -527,9 +594,11 @@ Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
 | **Cache + sliding window** | **7.2 s** |
 | **Speedup** | **15×** |
 
-### CUDA on NVIDIA T4
+---
 
-The CUDA backend uses **cuBLAS** for matmul, **cuFFT** for batched STFT, and **persistent device buffers** to eliminate per-operation host↔device transfers.
+## CUDA on NVIDIA T4
+
+The CUDA backend uses **cuBLAS** for matmul, **cuFFT** for batched STFT, and **persistent device buffers** to eliminate per-operation host ↔ device transfers.
 
 Results obtained on a virtualized NVIDIA Tesla T4 (Google Colab free tier, CUDA 12.8).
 
@@ -578,6 +647,7 @@ TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
 
 For Google Colab, see [`docs/colab_setup.md`](docs/colab_setup.md).
 
+---
 
 ## CLI
 
@@ -608,6 +678,7 @@ zilla generate:text \
 | **M6** | Transformer — attention, blocks, tokenizer | ✅ |
 | **M7** | Tiny language model + KV cache | ✅ |
 | **M8** | Native CPU backend + OpenBLAS | ✅ |
+| **M8.5** | Persistent CPU tensors — H0 rejected | ✅ |
 | **M9** | CUDA backend — matmul, elementwise, ReLU | ✅ |
 | **M9.5** | Persistent device tensors | ✅ |
 | **M10** | Vision — Conv2D, MaxPool | ✅ |
@@ -671,12 +742,6 @@ Before opening a PR:
 
 ---
 
-## License
-
-**Apache-2.0** — see [`LICENSE`](LICENSE).
-
----
-
 ## Project Identity
 
 ```text
@@ -690,8 +755,8 @@ PHP
  ├── Audio
  └── Runtime
         │
-        ├── CPU     → C / OpenBLAS
-        ├── CUDA    → NVIDIA GPU + cuBLAS / cuFFT
+        ├── CPU      → C / OpenBLAS + Persistent buffers
+        ├── CUDA     → NVIDIA GPU + cuBLAS / cuFFT + Persistent device tensors
         └── ROCm/HIP → AMD GPU (planned)
 ```
 
@@ -706,3 +771,10 @@ PHP
 **Author:** Yahaya Ibrahim  
 **Organization:** Yacksweb Tech  
 **Country:** Nigeria
+```
+
+## License
+
+**Apache-2.0** — see [`LICENSE`](LICENSE).
+
+---
