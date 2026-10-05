@@ -17,7 +17,7 @@
 
 extern "C" {
 
-#define ZILLA_MAX_BUFFERS 1024
+#define ZILLA_MAX_BUFFERS 8192
 
 typedef struct {
     float* ptr;

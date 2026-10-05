@@ -253,7 +253,7 @@ for ($step = 0; $step < $STEPS; $step++) {
     $backend->addBiasDev($f1Gpu, $b1Gpu, $SEQ, $D_FF);
 
     // F1_relu = ReLU(F1)
-    $backend->reluFwdDev($f1Gpu, $f1reluGpu, $backend->bufferAlloc(1), $SZ_FF);   // mask unused in v1
+    $backend->reluFwdDev($f1Gpu, $f1reluGpu, $m1FfGpu, $SZ_FF);
 
     // F2 = F1_relu @ W2 + b2
     $backend->matmulDev($f1reluGpu, $w2Gpu, $f2Gpu, $SEQ, $D_FF, $D_MODEL);
