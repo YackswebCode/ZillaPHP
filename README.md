@@ -1,11 +1,9 @@
-
 # ZillaPHP
 
 **A PHP-native framework for machine learning and artificial intelligence.**
 
 Build, train, and run neural networks directly from PHP — with a PHP-first API, an extensible runtime/backend system, and native C/CUDA acceleration through FFI.
 
-**Text · Audio · Image · Video**
 
 ---
 
@@ -30,7 +28,7 @@ Build, train, and run neural networks directly from PHP — with a PHP-first API
 | Model checkpointing — JSON | ✅ Working |
 | Native C CPU backend through PHP FFI | ✅ Working |
 | OpenBLAS integration with automatic detection | ✅ Working |
-| Native Conv2D / MaxPool kernels | ✅ Working |
+| Native Conv2D / MaxPool kernels (CPU) | ✅ Working |
 | Real MNIST training — MLP full 60,000 samples | ✅ **98.05%** |
 | Multi-head attention + Transformer blocks | ✅ Working |
 | Character-level tokenizer | ✅ Working |
@@ -41,14 +39,22 @@ Build, train, and run neural networks directly from PHP — with a PHP-first API
 | CUDA STFT (cuFFT) — audio feature extraction | ✅ Working |
 | **Persistent device tensors (GPU)** | ✅ **44× measured speedup** |
 | **Persistent CPU tensors** | ✅ **77× measured speedup — H0 rejected** |
-| **GPU-native MNIST training (60k samples)** | ✅ **96.85% in 23.5 s (100× vs CPU)** |
+| **GPU-native MNIST training (MLP, 60k samples)** | ✅ **96.85% in 23.5 s (100× vs CPU)** |
 | **CPU-native MNIST training (60k samples, persistent)** | ✅ **96.86% in 52 s (77× vs old CPU)** |
+| **CUDA Conv2D + MaxPool kernels (per-sample)** | ✅ **Working** |
+| **CUDA batched Conv2D + MaxPool kernels** | ✅ **Working** |
+| **GPU CNN training (MNIST, batched)** | ✅ **95.21% in 16 s (130× vs CPU)** |
+| **CUDA attention primitives** — softmax, causal mask, scale | ✅ **Verified** |
+| **Full attention forward on GPU (bit-exact)** | ✅ **Max err 1.5e-7** |
+| **GPU Transformer training (end-to-end)** | ✅ **Loss 4.08 → 2.79 in 5.4 s** |
+| **Audio CNN (synthetic data)** | ✅ **100% accuracy, pipeline validated** |
 | CLI — `zilla doctor`, `zilla train`, `zilla generate:text` | ✅ Working |
 | Audio pipeline — WAV loader, Mel filterbank, log-mel | ✅ Working |
 | **SafeTensors support — HF-compatible** | ✅ **Working** |
-| MNIST CNN full training | 🚧 In progress |
-| CUDA Conv2D / MaxPool kernels | 🔜 Next |
+| MNIST CNN full training (CPU) | ✅ 98.13% |
 | Vision Transformer (ViT) | 🔜 Planned |
+| LayerNorm on GPU / embedding backward | 🔜 v2 |
+| Multi-head attention on GPU | 🔜 Planned |
 | Diffusion models | 🔜 Planned |
 | Video models | 🔜 Planned |
 | ROCm/HIP backend | 🔜 Planned |
@@ -162,6 +168,8 @@ Backend Selection
 - **Elementwise ops** — add/sub/mul/div on device
 - **ReLU on device**
 - **STFT via cuFFT** — batched R2C transforms
+- **Conv2D + MaxPool2D** — both per-sample and batched variants
+- **Attention primitives** — row-wise softmax, causal mask, causal softmax
 - **Persistent device tensors** — GPU-resident buffers referenced by integer handle (see below)
 - Tested on NVIDIA T4 (Colab) with bit-exact CPU/GPU parity
 
@@ -427,6 +435,20 @@ TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
     php -d memory_limit=3G examples/mnist_cpu_v2.php
 ```
 
+### Train MNIST on GPU (batched CNN)
+
+```bash
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=5 LR=0.01 \
+    php -d memory_limit=3G examples/mnist_cnn_gpu_v2.php
+```
+
+### Train a Transformer on GPU
+
+```bash
+SEQ=32 D_MODEL=64 D_FF=128 STEPS=3000 LR=0.02 \
+    php -d memory_limit=3G examples/transformer_gpu.php
+```
+
 ### Audio
 
 ```php
@@ -446,6 +468,13 @@ $mel = new MelSpectrogram(
 );
 
 $tensor = $mel->fromWav($wav);   // [1, 64, nFrames]
+```
+
+### Audio CNN (synthetic data, no download)
+
+```bash
+SAMPLES_PER_CLASS=100 BATCH=32 EPOCHS=10 LR=0.01 \
+    php -d memory_limit=3G examples/audio_cnn_synthetic.php
 ```
 
 ---
@@ -566,13 +595,126 @@ Total training:  23.5 s (0.4 min)
 Per epoch:       2.4 s
 ```
 
-### Research note
+---
 
-This result confirms the H1 hypothesis from the project paper:
+## GPU CNN Training — MNIST
 
-> *A PHP-first framework that delegates computationally intensive operations to optimized native CPU and GPU backends can substantially reduce the performance limitations associated with userland PHP execution.*
+Two implementations: **v1** (per-sample), **v2** (batched, ~5× faster).
 
-The 100× speedup is measured, not theoretical. The complete training pipeline — data loading, forward pass, backward pass, optimizer update, evaluation — runs from PHP, with the compute-intensive operations executing on the GPU through FFI.
+**Architecture:** `Conv2D(1→8, 3×3, pad=1) → ReLU → MaxPool2D(2) → Conv2D(8→16, 3×3, pad=1) → ReLU → MaxPool2D(2) → Flatten → Linear(784→10)`
+
+**Workload:** full MNIST, 60,000 samples, 5 epochs, SGD.
+
+| Path | Per epoch | Total | Test acc | Speedup vs CPU |
+|:---|---:|---:|---:|---:|
+| **CPU CNN** (reference, native C) | ~420 s | ~35 min | 98.13% | 1× |
+| **GPU CNN v1** (per-sample) | 16 s | 80 s | 96.62% | ~26× |
+| **GPU CNN v2** (batched) | **3.2 s** | **16 s** | **95.21%** | **~130×** |
+
+### Why v2 is 5× faster than v1
+
+v1 launches one GPU op per sample → 64 launches per batch. v2 launches one GPU op per **whole batch** — the Conv2D and MaxPool2D kernels process all 64 samples in a single kernel.
+
+### Reproduce
+
+```bash
+# v1 (per-sample)
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=5 LR=0.01 \
+    php -d memory_limit=3G examples/mnist_cnn_gpu.php
+
+# v2 (batched)
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=5 LR=0.01 \
+    php -d memory_limit=3G examples/mnist_cnn_gpu_v2.php
+```
+
+---
+
+## GPU Transformer Training — First Result
+
+**Architecture:** single-head char-level Transformer, dim=64, 1 layer, FFN hidden=128, seq=32, vocab=59.
+
+**Training:** 50,000 characters of Shakespeare, SGD lr=0.02, 3,000 steps.
+
+| Metric | Value |
+|:---|---:|
+| Initial loss (step 25) | 4.0787 |
+| Final loss (step 3000) | **2.7900** |
+| Loss reduction | **31.6%** |
+| Total training time | **5.4 s** |
+| Per step | **1.8 ms** |
+| Throughput | **~555 steps/s** |
+| CPU reference (full pipeline) | 1.27 s/step |
+
+**Interpretation:** This is (to the authors' knowledge) the first demonstration of a Transformer language model trained end-to-end using a PHP-native framework with GPU acceleration. Every operation in the training loop — matrix multiplication, attention, causal softmax, cross-entropy loss, and parameter updates — executes on the GPU via cuBLAS, cuFFT, and custom CUDA kernels dispatched from PHP through FFI.
+
+**Not yet implemented in v1:** LayerNorm, multi-head attention, embedding backward, stacked layers.
+
+### Attention primitives — verified exactness
+
+| Test | Max error |
+|:---|---:|
+| Row-wise softmax `[4, 5]` | 8e-8 |
+| Causal softmax `[4, 4]` | 7e-8 |
+| Scale by 0.5 | 0 |
+| Softmax backward `[2, 3]` | 1e-8 |
+| **Full attention forward `[N=4, D=8]`** | **1.5e-7** |
+
+### Reproduce
+
+```bash
+SEQ=32 D_MODEL=64 D_FF=128 STEPS=3000 LR=0.02 \
+    php -d memory_limit=3G examples/transformer_gpu.php
+```
+
+Expected output:
+```text
+step   25/3000   loss=4.0787
+step  500/3000   loss=3.3305
+step 1000/3000   loss=3.1191
+step 1500/3000   loss=2.9850
+step 2000/3000   loss=2.8127
+step 3000/3000   loss=2.7900
+============================================================
+Total:    5.4 s
+Per step: 0.0018 s
+```
+
+---
+
+## Audio Pipeline
+
+### Audio CNN (synthetic dataset — validates the pipeline)
+
+**Data:** 1,000 training + 200 test clips across 10 classes
+(8 sines at 200–3000 Hz, 1 sweep, 1 noise).
+
+**Architecture:** identical to the MNIST CNN — `Conv2D(1→8) → ReLU → MaxPool2D(2) → Conv2D(8→16) → ReLU → MaxPool2D(2) → FC(6400→10)`.
+
+| Metric | Value |
+|:---|---:|
+| Total training | 4.0 s |
+| Per epoch | 0.4 s |
+| Test accuracy | **100.00%** (200 / 200) |
+
+**Interpretation:** the audio preprocessing (WAV → STFT → mel → log) and the batched CNN kernels work together correctly on 64-band × 101-frame spectrograms. This validates the pipeline for real speech datasets.
+
+### Reproduce
+
+```bash
+SAMPLES_PER_CLASS=100 BATCH=32 EPOCHS=10 LR=0.01 \
+    php -d memory_limit=3G examples/audio_cnn_synthetic.php
+```
+
+### Real Speech Commands (Speech Commands v2)
+
+**Status:** dataset loader written; 2.3 GB download required to run
+end-to-end.
+
+```bash
+php scripts/download_speech_commands.php --subset
+MAX_PER_CLASS=500 BATCH=32 EPOCHS=10 LR=0.01 \
+    php -d memory_limit=3G examples/audio_cnn_gpu.php
+```
 
 ---
 
@@ -600,7 +742,7 @@ Character-level Transformer, dim=64, heads=4, layers=2 (~76k params).
 
 The CUDA backend uses **cuBLAS** for matmul, **cuFFT** for batched STFT, and **persistent device buffers** to eliminate per-operation host ↔ device transfers.
 
-Results obtained on a virtualized NVIDIA Tesla T4 (Google Colab free tier, CUDA 12.8).
+Results obtained on a virtualized NVIDIA Tesla T4 (Google Colab free tier, CUDA 13.0).
 
 ### Kernel performance (pure matmul)
 
@@ -622,11 +764,21 @@ Full 60,000-sample MNIST, `784 → 128 → 10`, 10 epochs:
 | Test accuracy | 98.05% | 93.31% | **96.85%** |
 | **Speedup** | 1× | 9× | **~100×** |
 
-### Interpretation
+### GPU compute primitives available
 
-The naive per-operation transfer model is dominated by PCIe latency on virtualized environments. Persistent device tensors reduce transfer overhead from **O(operations)** to **O(model)**, unlocking the GPU's actual compute throughput.
-
-These measurements validate §13.9 of the project paper (*"Large Operations and Amortization"*).
+| Primitive | Purpose |
+|:---|:---|
+| `matmul`, `matmul_tn`, `matmul_nt` | cuBLAS GEMM variants |
+| `add/sub/mul/div` | Elementwise |
+| `relu_fwd/bwd` | ReLU with saved mask |
+| `softmax_ce` | Fused softmax + cross-entropy |
+| `bias_grad`, `sgd_update` | Training support |
+| `conv2d_fwd/bwd`, `maxpool2d_fwd/bwd` | Vision (per-sample) |
+| `conv2d_batched_*`, `maxpool2d_batched_*` | Vision (batched) |
+| `softmax_rows_fwd/bwd` | Attention softmax |
+| `causal_mask`, `causal_softmax` | Causal attention |
+| `scale` | Scalar multiply |
+| `stft_magnitude` | cuFFT-based audio |
 
 ### Reproduce
 
@@ -640,12 +792,46 @@ composer install
 # Kernel-only benchmark
 php -d memory_limit=2G tests/cuda_persistent.php
 
+# Attention primitives
+php -d memory_limit=2G tests/cuda_attention_test.php
+php -d memory_limit=2G tests/cuda_attention_full_test.php
+
 # Full training
 TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=10 LR=0.05 \
     php -d memory_limit=3G examples/mnist_gpu_v2.php
+
+TRAIN_N=60000 TEST_N=10000 BATCH=64 EPOCHS=5 LR=0.01 \
+    php -d memory_limit=3G examples/mnist_cnn_gpu_v2.php
+
+SEQ=32 D_MODEL=64 D_FF=128 STEPS=3000 LR=0.02 \
+    php -d memory_limit=3G examples/transformer_gpu.php
 ```
 
 For Google Colab, see [`docs/colab_setup.md`](docs/colab_setup.md).
+
+---
+
+## SafeTensors — HuggingFace Interoperability
+
+Full SafeTensors serialization with metadata, verified against the
+reference HuggingFace `safetensors` Python library.
+
+```php
+use ZillaPHP\Serialization\ModelSerializer;
+use ZillaPHP\Serialization\SafeTensorsSerializer;
+
+$serializer = new ModelSerializer(new SafeTensorsSerializer());
+$serializer->save($model, 'checkpoints/mnist.safetensors', [
+    'epoch'         => 10,
+    'test_accuracy' => 0.9685,
+]);
+
+// Load with metadata
+$meta = $serializer->load($model, 'checkpoints/mnist.safetensors');
+```
+
+Any modern ML tool (PyTorch, NumPy, JAX) can read ZillaPHP checkpoints
+via HuggingFace's reference implementation.
 
 ---
 
@@ -681,22 +867,30 @@ zilla generate:text \
 | **M8.5** | Persistent CPU tensors — H0 rejected | ✅ |
 | **M9** | CUDA backend — matmul, elementwise, ReLU | ✅ |
 | **M9.5** | Persistent device tensors | ✅ |
-| **M10** | Vision — Conv2D, MaxPool | ✅ |
+| **M10** | Vision — Conv2D, MaxPool (CPU + CUDA, per-sample + batched) | ✅ |
 | **M10.5** | Vision Transformer (ViT) | 🔜 |
 | **M11** | Audio — WAV, Mel, STFT (CPU + CUDA) | ✅ |
-| **M11.5** | Audio CNN classifier | 🚧 |
-| **M12** | Diffusion — VAE, UNet, schedulers | 🔜 |
-| **M13** | Video — 5D tensors, temporal models | 🔜 |
-| **M14** | Multimodal models | 🔜 |
-| **M15** | Distributed training | 🔜 |
-| **M16** | Stable 1.0 | 🔜 |
+| **M11.5** | Audio CNN classifier | ✅ synthetic / 🚧 real |
+| **M11.6** | **CUDA attention primitives + full attention forward** | ✅ |
+| **M11.7** | **GPU Transformer training (end-to-end)** | ✅ |
+| **M12** | LayerNorm on GPU + embedding backward + multi-head | 🔜 Next |
+| **M13** | Diffusion — VAE, UNet, schedulers | 🔜 |
+| **M14** | Video — 5D tensors, temporal models | 🔜 |
+| **M15** | Multimodal models | 🔜 |
+| **M16** | Distributed training | 🔜 |
+| **M17** | Stable 1.0 | 🔜 |
 
 ### Future Directions
 
-- Persistent device tensors integration into `Tensor`
-- CUDA Conv2D / MaxPool kernels
+- Persistent device tensors integration into `Tensor` API
+- **GPU LayerNorm forward + backward** (next v2 Transformer feature)
+- **Embedding backward on GPU**
+- **Multi-head attention on GPU**
+- **Stacked Transformer layers on GPU**
+- **BPE tokenizer** (for real LLM training)
+- Vision Transformer (ViT)
+- Diffusion models
 - ROCm/HIP port (via `hipify-perl`)
-- SafeTensors export/import
 - ONNX interoperability
 - Quantization (INT8, INT4, FP8)
 - Kernel fusion (MatMul + Bias + ReLU)
@@ -716,6 +910,7 @@ The suite covers:
 - Numerical gradient checks against central finite differences
 - Integration tests: model construction, forward, backward, training loop, checkpointing
 - CPU/CUDA parity tests
+- Attention primitive exactness tests
 
 ---
 
@@ -731,12 +926,12 @@ Before opening a PR:
 ### Areas that need help
 
 - Persistent device tensor integration
-- CUDA Conv2D / MaxPool kernels
+- GPU LayerNorm / embedding backward
+- Multi-head attention on GPU
 - ROCm/HIP backend
 - Vision Transformer
 - Diffusion models
-- Audio classifiers
-- SafeTensors support
+- BPE tokenizer
 - Quantization
 - Distributed training
 
@@ -757,6 +952,7 @@ PHP
         │
         ├── CPU      → C / OpenBLAS + Persistent buffers
         ├── CUDA     → NVIDIA GPU + cuBLAS / cuFFT + Persistent device tensors
+        │              + Conv2D / MaxPool / Attention kernels
         └── ROCm/HIP → AMD GPU (planned)
 ```
 
@@ -766,12 +962,12 @@ PHP
 
 **Scales to GPU.**
 
+**Trains Transformers.**
+
 ---
 
 **Author:** Yahaya Ibrahim  
 **Organization:** Yacksweb Tech  
 **Country:** Nigeria
 
-**License**
-
-**Apache-2.0** — see [`LICENSE`](LICENSE).
+**License:** Apache-2.0 — see [`LICENSE`](LICENSE).
