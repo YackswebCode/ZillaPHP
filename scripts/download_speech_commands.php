@@ -30,29 +30,21 @@ if (!is_file($tarball)) {
     echo "Downloading Speech Commands v2 (~2.3 GB)...\n";
     echo "This may take 5-15 minutes depending on your connection.\n\n";
 
-    $fp = fopen($tarball, 'wb');
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_FILE, $fp);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($res, $dl, $total) {
-        static $last = 0;
-        if ($total > 0 && time() - $last >= 2) {
-            printf("  %.1f%% (%.0f MB / %.0f MB)\n",
-                100.0 * $dl / $total,
-                $dl / 1048576,
-                $total / 1048576
-            );
-            $last = time();
-        }
-        return 0;
-    });
-    curl_setopt($ch, CURLOPT_NOPROGRESS, false);
-    curl_exec($ch);
-    curl_close($ch);
-    fclose($fp);
-    echo "\nDownload complete.\n\n";
+    // Use wget — available on all Colab/Linux systems, no PHP curl ext needed
+    $cmd = 'wget -q --show-progress -O '
+         . escapeshellarg($tarball) . ' '
+         . escapeshellarg($url);
+    passthru($cmd, $code);
+
+    if ($code !== 0 || !is_file($tarball) || filesize($tarball) < 1_000_000) {
+        fwrite(STDERR, "Download failed or file too small.\n");
+        if (is_file($tarball)) unlink($tarball);
+        exit(1);
+    }
+
+    echo "\nDownload complete: " . round(filesize($tarball) / 1048576) . " MB\n\n";
 } else {
-    echo "Tarball already present.\n\n";
+    echo "Tarball already present (" . round(filesize($tarball) / 1048576) . " MB).\n\n";
 }
 
 // ---- Extract ----
