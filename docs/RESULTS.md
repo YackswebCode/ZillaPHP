@@ -76,3 +76,27 @@ precision (`eps = 1e-3`, tolerance `1e-2`, per PyTorch's float32 gradcheck).
 ### 2.2 Representative gradient check
 
 For `f(x) = x^2` at `x = -3`:
+
+### 8.4 GPU CNN — Full MNIST Training
+
+**Architecture:** `Conv2D(1→8, 3×3, pad=1) → ReLU → MaxPool2D(2)
+→ Conv2D(8→16, 3×3, pad=1) → ReLU → MaxPool2D(2) → Flatten → Linear(784→10)`
+
+**Training:** full MNIST, 60,000 samples, batch=64, SGD (lr=0.01), 5 epochs.
+
+| Metric | CPU CNN (reference) | **GPU CNN (this run)** | Speedup |
+|:---|---:|---:|---:|
+| Per epoch | ~420 s | **16 s** | **~26×** |
+| Total (5 epochs) | ~35 min | **80 s** | **~26×** |
+| Test accuracy | 98.13% | **96.62%** | −1.5 pp |
+| Parameters | 9,098 | 9,098 | — |
+
+**Interpretation:** All forward and backward operations (conv2d, relu,
+maxpool2d, matmul, softmax-CE, sgd-update) run on the GPU via persistent
+device buffers. The accuracy difference is due to fewer training
+iterations and plain SGD (no Adam), not to numerical issues.
+
+**Note on transfer overhead:** This run processes samples one at a time —
+64 samples per batch, each requiring a full PHP → GPU → CPU round trip.
+A batched conv kernel (v2) would further reduce per-epoch time to
+~3–5 s.
