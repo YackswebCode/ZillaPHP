@@ -79,7 +79,9 @@ $b2 = array_fill(0, $D_MODEL, 0.0);
 $wlm = randnArr($D_MODEL * $vocabSize, xavier($D_MODEL, $vocabSize));
 $blm = array_fill(0, $vocabSize, 0.0);
 
-// ---- Allocate ----
+// ====================================================================
+// Allocate GPU buffers — ONCE
+// ====================================================================
 echo "Allocating GPU buffers...\n";
 
 $SZ_EMB   = $vocabSize * $D_MODEL;
@@ -90,6 +92,7 @@ $SZ_S     = $SEQ * $SEQ;
 $SZ_FF    = $SEQ * $D_FF;
 $SZ_LOGI  = $SEQ * $vocabSize;
 
+// ---- Weights ----
 $embGpu  = $backend->bufferAlloc($SZ_EMB);
 $posGpu  = $backend->bufferAlloc($SZ_POS);
 $wqGpu   = $backend->bufferAlloc($D_MODEL * $D_MODEL);
@@ -103,38 +106,39 @@ $b2Gpu   = $backend->bufferAlloc($D_MODEL);
 $wlmGpu  = $backend->bufferAlloc($D_MODEL * $vocabSize);
 $blmGpu  = $backend->bufferAlloc($vocabSize);
 
-// Activations
-$xGpu    = $backend->bufferAlloc($SZ_X);
-$qGpu    = $backend->bufferAlloc($SZ_QKV);
-$kTmpGpu = $backend->bufferAlloc($D_MODEL * $SEQ);   // K transposed
-$vGpu    = $backend->bufferAlloc($SZ_QKV);
-$sGpu    = $backend->bufferAlloc($SZ_S);              // attention scores (pre-softmax)
-$pGpu    = $backend->bufferAlloc($SZ_S);              // post-softmax
-$oGpu    = $backend->bufferAlloc($SZ_QKV);            // attention output
-$y1Gpu   = $backend->bufferAlloc($SZ_X);              // X + O (residual)
-$f1Gpu   = $backend->bufferAlloc($SZ_FF);             // Y1 @ W1
-$f1reluGpu = $backend->bufferAlloc($SZ_FF);
-$f2Gpu   = $backend->bufferAlloc($SZ_X);              // f1_relu @ W2
-$y2Gpu   = $backend->bufferAlloc($SZ_X);              // Y1 + F2
-$logGpu  = $backend->bufferAlloc($SZ_LOGI);
+// ---- Activations ----
+$xGpu      = $backend->bufferAlloc($SZ_X);
+$qGpu      = $backend->bufferAlloc($SZ_QKV);
+$kTmpGpu   = $backend->bufferAlloc($D_MODEL * $SEQ);   // K transposed [D, SEQ]
+$vGpu      = $backend->bufferAlloc($SZ_QKV);
+$sGpu      = $backend->bufferAlloc($SZ_S);             // attention scores (pre-softmax)
+$pGpu      = $backend->bufferAlloc($SZ_S);             // post-softmax
+$oGpu      = $backend->bufferAlloc($SZ_QKV);           // attention output
+$y1Gpu     = $backend->bufferAlloc($SZ_X);             // X + O (residual)
+$f1Gpu     = $backend->bufferAlloc($SZ_FF);            // Y1 @ W1 + b1
+$f1reluGpu = $backend->bufferAlloc($SZ_FF);            // ReLU(F1)
+$m1FfGpu   = $backend->bufferAlloc($SZ_FF);            // ReLU mask (allocated once)
+$f2Gpu     = $backend->bufferAlloc($SZ_X);             // F1_relu @ W2 + b2
+$y2Gpu     = $backend->bufferAlloc($SZ_X);             // Y1 + F2
+$logGpu    = $backend->bufferAlloc($SZ_LOGI);          // Y2 @ Wlm + blm
 
-// Backward temps
-$dLogGpu = $backend->bufferAlloc($SZ_LOGI);
-$dY2Gpu  = $backend->bufferAlloc($SZ_X);
-$dF2Gpu  = $backend->bufferAlloc($SZ_X);
-$dF1Gpu  = $backend->bufferAlloc($SZ_FF);
+// ---- Backward temporaries ----
+$dLogGpu    = $backend->bufferAlloc($SZ_LOGI);
+$dY2Gpu     = $backend->bufferAlloc($SZ_X);
+$dF2Gpu     = $backend->bufferAlloc($SZ_X);
+$dF1Gpu     = $backend->bufferAlloc($SZ_FF);
 $dF1ReluGpu = $backend->bufferAlloc($SZ_FF);
-$dY1Gpu  = $backend->bufferAlloc($SZ_X);
-$dOGpu   = $backend->bufferAlloc($SZ_QKV);
-$dPGpu   = $backend->bufferAlloc($SZ_S);
-$dSGpu   = $backend->bufferAlloc($SZ_S);
-$dQGpu   = $backend->bufferAlloc($SZ_QKV);
-$dKTmpGpu = $backend->bufferAlloc($D_MODEL * $SEQ);
-$dKGpu   = $backend->bufferAlloc($SZ_QKV);
-$dVGpu   = $backend->bufferAlloc($SZ_QKV);
-$dXGpu   = $backend->bufferAlloc($SZ_X);
+$dY1Gpu     = $backend->bufferAlloc($SZ_X);
+$dOGpu      = $backend->bufferAlloc($SZ_QKV);
+$dPGpu      = $backend->bufferAlloc($SZ_S);
+$dSGpu      = $backend->bufferAlloc($SZ_S);
+$dQGpu      = $backend->bufferAlloc($SZ_QKV);
+$dKTmpGpu   = $backend->bufferAlloc($D_MODEL * $SEQ);
+$dKGpu      = $backend->bufferAlloc($SZ_QKV);
+$dVGpu      = $backend->bufferAlloc($SZ_QKV);
+$dXGpu      = $backend->bufferAlloc($SZ_X);
 
-// Gradient accumulators (zeroed per step)
+// ---- Gradient accumulators ----
 $dEmbGpu = $backend->bufferAlloc($SZ_EMB);
 $dPosGpu = $backend->bufferAlloc($SZ_POS);
 $dWqGpu  = $backend->bufferAlloc($D_MODEL * $D_MODEL);
@@ -148,7 +152,11 @@ $db2Gpu  = $backend->bufferAlloc($D_MODEL);
 $dWlmGpu = $backend->bufferAlloc($D_MODEL * $vocabSize);
 $dblmGpu = $backend->bufferAlloc($vocabSize);
 
-// Upload initial weights
+// ---- Targets + loss ----
+$yInGpu  = $backend->bufferAlloc($SEQ);
+$lossGpu = $backend->bufferAlloc(1);
+
+// ---- Upload initial weights ----
 $backend->bufferUpload($embGpu, $embW);
 $backend->bufferUpload($posGpu, $posW);
 $backend->bufferUpload($wqGpu,  $wq);
@@ -162,14 +170,15 @@ $backend->bufferUpload($b2Gpu,  $b2);
 $backend->bufferUpload($wlmGpu, $wlm);
 $backend->bufferUpload($blmGpu, $blm);
 
-// Reusable small buffers for targets + loss
-$yInGpu   = $backend->bufferAlloc($SEQ);
-$lossGpu  = $backend->bufferAlloc(1);
-
 echo "Backend: " . $backend->name() . "\n";
 echo "Transformer: dim=$D_MODEL, head=1, seq=$SEQ, ffn=$D_FF, vocab=$vocabSize\n";
 echo "Training on " . $nTokens . " tokens from Shakespeare\n";
 echo str_repeat('=', 60) . "\n";
+
+// ====================================================================
+// Cache the embeddings on CPU side (avoids downloading per step)
+// ====================================================================
+$cpuEmb = $embW;   // We keep a CPU copy in sync with the GPU buffer
 
 // ====================================================================
 // Training loop
@@ -183,16 +192,13 @@ for ($step = 0; $step < $STEPS; $step++) {
     $inputIds  = array_slice($ids, $start, $SEQ);
     $targetIds = array_slice($ids, $start + 1, $SEQ);
 
-    // ---- Upload inputs and targets ----
-    // X = emb[inputIds] + pos[0..SEQ-1]
-    // We compute this on CPU (emb lookup) then upload
-    $cpuEmb = $backend->bufferDownload($embGpu, $SZ_EMB);
-    $cpuPos = $backend->bufferDownload($posGpu, $SZ_POS);
+    // ---- Build X = emb[inputIds] + pos[0..SEQ-1] on CPU ----
+    // Use the local $cpuEmb and $posW caches (kept in sync with GPU updates)
     $xFlat = [];
     for ($t = 0; $t < $SEQ; $t++) {
         $tok = $inputIds[$t];
         for ($d = 0; $d < $D_MODEL; $d++) {
-            $xFlat[] = $cpuEmb[$tok * $D_MODEL + $d] + $cpuPos[$t * $D_MODEL + $d];
+            $xFlat[] = $cpuEmb[$tok * $D_MODEL + $d] + $posW[$t * $D_MODEL + $d];
         }
     }
     $backend->bufferUpload($xGpu, $xFlat);
@@ -201,37 +207,45 @@ for ($step = 0; $step < $STEPS; $step++) {
     $yFlat = array_map('floatval', $targetIds);
     $backend->bufferUpload($yInGpu, $yFlat);
 
-    // Zero gradients + loss
+    // ---- Zero gradients + loss ----
     $backend->zeroDev($lossGpu, 1);
-    foreach ([[$dEmbGpu, $SZ_EMB], [$dPosGpu, $SZ_POS],
-              [$dWqGpu, $D_MODEL*$D_MODEL], [$dWkGpu, $D_MODEL*$D_MODEL],
-              [$dWvGpu, $D_MODEL*$D_MODEL], [$dWoGpu, $D_MODEL*$D_MODEL],
-              [$dW1Gpu, $D_MODEL*$D_FF], [$db1Gpu, $D_FF],
-              [$dW2Gpu, $D_FF*$D_MODEL], [$db2Gpu, $D_MODEL],
-              [$dWlmGpu, $D_MODEL*$vocabSize], [$dblmGpu, $vocabSize]] as [$id, $sz]) {
+    foreach ([
+        [$dEmbGpu, $SZ_EMB], [$dPosGpu, $SZ_POS],
+        [$dWqGpu,  $D_MODEL*$D_MODEL], [$dWkGpu, $D_MODEL*$D_MODEL],
+        [$dWvGpu,  $D_MODEL*$D_MODEL], [$dWoGpu, $D_MODEL*$D_MODEL],
+        [$dW1Gpu,  $D_MODEL*$D_FF],    [$db1Gpu, $D_FF],
+        [$dW2Gpu,  $D_FF*$D_MODEL],    [$db2Gpu, $D_MODEL],
+        [$dWlmGpu, $D_MODEL*$vocabSize],[$dblmGpu, $vocabSize],
+    ] as [$id, $sz]) {
         $backend->zeroDev($id, $sz);
     }
 
-    // ---- FORWARD ----
-    // Q = X @ Wq,  K = X @ Wk,  V = X @ Wv
+    // ================================================================
+    // FORWARD
+    // ================================================================
+
+    // Q = X @ Wq
     $backend->matmulDev($xGpu, $wqGpu, $qGpu, $SEQ, $D_MODEL, $D_MODEL);
-    $backend->matmulDev($xGpu, $wkGpu, $vGpu, $SEQ, $D_MODEL, $D_MODEL);   // temp into vGpu
-    // (We need K transposed [D, SEQ], so first compute K = X @ Wk, then transpose)
+
+    // K = X @ Wk  (into vGpu temporarily)
+    $backend->matmulDev($xGpu, $wkGpu, $vGpu, $SEQ, $D_MODEL, $D_MODEL);
     $backend->sync();
     $kFlat = $backend->bufferDownload($vGpu, $SZ_QKV);
+
+    // K^T — transpose on CPU (small: SEQ × D_MODEL)
     $kT = [];
     for ($d = 0; $d < $D_MODEL; $d++)
         for ($t = 0; $t < $SEQ; $t++) $kT[] = $kFlat[$t * $D_MODEL + $d];
     $backend->bufferUpload($kTmpGpu, $kT);
 
-    // Now compute V = X @ Wv (overwrite vGpu with real V)
+    // V = X @ Wv  (overwrite vGpu)
     $backend->matmulDev($xGpu, $wvGpu, $vGpu, $SEQ, $D_MODEL, $D_MODEL);
 
     // S = Q @ K^T  [SEQ, SEQ]
     $backend->matmulDev($qGpu, $kTmpGpu, $sGpu, $SEQ, $D_MODEL, $SEQ);
     $backend->scaleDev($sGpu, $scale, $SEQ * $SEQ);
 
-    // P = causal_softmax(S)  (in place)
+    // P = causal_softmax(S) — in place
     $backend->causalSoftmaxDev($sGpu, $SEQ, $SEQ);
     $backend->sync();
     $pFlat = $backend->bufferDownload($sGpu, $SZ_S);
@@ -240,138 +254,111 @@ for ($step = 0; $step < $STEPS; $step++) {
     // O = P @ V  [SEQ, D_MODEL]
     $backend->matmulDev($pGpu, $vGpu, $oGpu, $SEQ, $SEQ, $D_MODEL);
 
-    // Y1 = X + O  (residual)
+    // ---- Y1 = X + O (residual) ----
     $backend->sync();
-    $xFlatBack = $backend->bufferDownload($xGpu, $SZ_X);
-    $oFlat     = $backend->bufferDownload($oGpu, $SZ_QKV);
-    $y1Flat    = [];
-    for ($i = 0; $i < $SZ_X; $i++) $y1Flat[] = $xFlatBack[$i] + $oFlat[$i];
+    $oFlat = $backend->bufferDownload($oGpu, $SZ_QKV);
+    $y1Flat = [];
+    for ($i = 0; $i < $SZ_X; $i++) $y1Flat[] = $xFlat[$i] + $oFlat[$i];
     $backend->bufferUpload($y1Gpu, $y1Flat);
 
-    // F1 = Y1 @ W1 + b1
+    // ---- F1 = Y1 @ W1 + b1 ----
     $backend->matmulDev($y1Gpu, $w1Gpu, $f1Gpu, $SEQ, $D_MODEL, $D_FF);
     $backend->addBiasDev($f1Gpu, $b1Gpu, $SEQ, $D_FF);
 
-    // F1_relu = ReLU(F1)
+    // ---- F1_relu = ReLU(F1); save mask ----
     $backend->reluFwdDev($f1Gpu, $f1reluGpu, $m1FfGpu, $SZ_FF);
 
-    // F2 = F1_relu @ W2 + b2
+    // ---- F2 = F1_relu @ W2 + b2 ----
     $backend->matmulDev($f1reluGpu, $w2Gpu, $f2Gpu, $SEQ, $D_FF, $D_MODEL);
     $backend->addBiasDev($f2Gpu, $b2Gpu, $SEQ, $D_MODEL);
 
-    // Y2 = Y1 + F2
+    // ---- Y2 = Y1 + F2 ----
     $backend->sync();
-    $y1Data = $backend->bufferDownload($y1Gpu, $SZ_X);
-    $f2Data = $backend->bufferDownload($f2Gpu, $SZ_X);
+    $f2Flat = $backend->bufferDownload($f2Gpu, $SZ_X);
     $y2Flat = [];
-    for ($i = 0; $i < $SZ_X; $i++) $y2Flat[] = $y1Data[$i] + $f2Data[$i];
+    for ($i = 0; $i < $SZ_X; $i++) $y2Flat[] = $y1Flat[$i] + $f2Flat[$i];
     $backend->bufferUpload($y2Gpu, $y2Flat);
 
-    // Logits = Y2 @ Wlm + blm
+    // ---- Logits = Y2 @ Wlm + blm ----
     $backend->matmulDev($y2Gpu, $wlmGpu, $logGpu, $SEQ, $D_MODEL, $vocabSize);
     $backend->addBiasDev($logGpu, $blmGpu, $SEQ, $vocabSize);
 
-    // ---- Loss + backward ----
+    // ================================================================
+    // LOSS
+    // ================================================================
     $backend->softmaxCeDev($logGpu, $yInGpu, $dLogGpu, $lossGpu, $SEQ, $vocabSize);
     $backend->sync();
 
     $lossVal = $backend->bufferDownload($lossGpu, 1)[0] / $SEQ;
     $runningLoss += $lossVal;
 
-    // dLogits → dW_lm, db_lm, dY2
+    // ================================================================
+    // BACKWARD
+    // ================================================================
+
+    // --- Through LM head ---
     // dW_lm = Y2^T @ dLogits
     $backend->matmulTnDev($y2Gpu, $dLogGpu, $dWlmGpu, $D_MODEL, $SEQ, $vocabSize);
     $backend->biasGradDev($dLogGpu, $dblmGpu, $SEQ, $vocabSize);
     // dY2 = dLogits @ W_lm^T
     $backend->matmulNtDev($dLogGpu, $wlmGpu, $dY2Gpu, $SEQ, $vocabSize, $D_MODEL);
 
-    // Through residual: dY1a = dY2, dF2 = dY2
+    // --- Through FFN ---
+    // dF2 = dY2 (identity through Y2 = Y1 + F2)
     // dW2 = F1_relu^T @ dF2
     $backend->matmulTnDev($f1reluGpu, $dY2Gpu, $dW2Gpu, $D_FF, $SEQ, $D_MODEL);
     $backend->biasGradDev($dY2Gpu, $db2Gpu, $SEQ, $D_MODEL);
     // dF1_relu = dF2 @ W2^T
     $backend->matmulNtDev($dY2Gpu, $w2Gpu, $dF1ReluGpu, $SEQ, $D_MODEL, $D_FF);
-    // dF1 = dF1_relu * (F1 > 0)
-    // We don't have the mask (v1 alloc'd a scratch), so recompute it inline:
-    $f1Data = $backend->bufferDownload($f1Gpu, $SZ_FF);
-    $df1rData = $backend->bufferDownload($dF1ReluGpu, $SZ_FF);
-    $df1Data = [];
-    for ($i = 0; $i < $SZ_FF; $i++) $df1Data[] = $f1Data[$i] > 0 ? $df1rData[$i] : 0.0;
-    $backend->bufferUpload($dF1Gpu, $df1Data);
-
+    // dF1 = dF1_relu * mask
+    $backend->reluBwdDev($dF1ReluGpu, $m1FfGpu, $dF1Gpu, $SZ_FF);
     // dW1 = Y1^T @ dF1
     $backend->matmulTnDev($y1Gpu, $dF1Gpu, $dW1Gpu, $D_MODEL, $SEQ, $D_FF);
     $backend->biasGradDev($dF1Gpu, $db1Gpu, $SEQ, $D_FF);
-    // dY1b = dF1 @ W1^T
+    // dY1_ffn = dF1 @ W1^T
     $backend->matmulNtDev($dF1Gpu, $w1Gpu, $dY1Gpu, $SEQ, $D_FF, $D_MODEL);
-    // Add residual contribution from dY2 (through Y2 = Y1 + F2)
+
+    // --- Combine residuals into dY1 ---
     $backend->sync();
-    $dy1bData = $backend->bufferDownload($dY1Gpu, $SZ_X);
-    $dy2Data  = $backend->bufferDownload($dY2Gpu, $SZ_X);
-    $dy1Flat  = [];
-    for ($i = 0; $i < $SZ_X; $i++) $dy1Flat[] = $dy1bData[$i] + $dy2Data[$i];
-    $backend->bufferUpload($dY1Gpu, $dy1Flat);
+    $dy1fFlat = $backend->bufferDownload($dY1Gpu, $SZ_X);
+    $dy2Flat  = $backend->bufferDownload($dY2Gpu, $SZ_X);
+    $dy1Total = [];
+    for ($i = 0; $i < $SZ_X; $i++) $dy1Total[] = $dy1fFlat[$i] + $dy2Flat[$i];
+    $backend->bufferUpload($dY1Gpu, $dy1Total);
 
-    // Through residual into attention: dO = dY1
-    $backend->bufferUpload($dOGpu, $dy1Flat);
+    // --- Through attention ---
+    // dO = dY1
+    $backend->bufferUpload($dOGpu, $dy1Total);
 
-    // Now backprop through attention.
-    // O = P @ V, so:
-    //   dP = dO @ V^T
-    //   dV = P^T @ dO
-    // We need V and P as saved earlier:
-    // (P = pGpu, V = vGpu)
-    // dP [SEQ, SEQ] = dO [SEQ, D] @ V^T
+    // dP = dO @ V^T
     $backend->matmulNtDev($dOGpu, $vGpu, $dPGpu, $SEQ, $D_MODEL, $SEQ);
-    // dV [SEQ, D] = P^T @ dO  -- actually P is [SEQ, SEQ], we need P^T @ dO:
-    //   P is stored [SEQ, SEQ], we want P^T [SEQ, SEQ] @ dO [SEQ, D]
-    //   Use matmul with P^T — but P stored [SEQ, SEQ], we'd need it transposed.
-    //   Alternative: matmulTn with P as [K=SEQ, M=SEQ] and dO as [K=SEQ, N=D]
-    //   gives dV [SEQ, D] = P^T @ dO. ✓
+    // dV = P^T @ dO
     $backend->matmulTnDev($pGpu, $dOGpu, $dVGpu, $SEQ, $SEQ, $D_MODEL);
-
-    // Now softmax backward: dS = softmax_bwd(P, dP)
+    // dS = softmax_bwd(P, dP)
     $backend->softmaxRowsBwdDev($pGpu, $dPGpu, $dSGpu, $SEQ, $SEQ);
-
-    // S = Q @ K^T / sqrt(d), so dS_scaled = dS / sqrt(d)
+    // Scale back: dS_prescaled = dS * scale
     $backend->scaleDev($dSGpu, $scale, $SEQ * $SEQ);
 
-    // dQ = dS @ K_scaledT where K_scaledT = kTmpGpu (already [D, SEQ])
-    // Wait — dQ [SEQ, D] = dS [SEQ, SEQ] @ K [SEQ, D].
-    // K is stored as kTmpGpu [D, SEQ] (transposed). We need K [SEQ, D].
-    // Alternatively: dQ = dS @ K = dS @ (K^T)^T. matmulNt(A=dS, B=kTmpGpu [D, SEQ]):
-    //   C [SEQ, D] = dS @ B^T = dS @ (kTmpGpu)^T = dS @ K. ✓
+    // dQ = dS @ K
     $backend->matmulNtDev($dSGpu, $kTmpGpu, $dQGpu, $SEQ, $SEQ, $D_MODEL);
-
-    // dK [SEQ, D] = dS^T @ Q
-    // dS is [SEQ, SEQ], Q is [SEQ, D]. Use matmulTn with A=dS [K=SEQ, M=SEQ],
-    // B=Q [K=SEQ, N=D]: C [SEQ, D] = dS^T @ Q. ✓
+    // dK = dS^T @ Q
     $backend->matmulTnDev($dSGpu, $qGpu, $dKGpu, $SEQ, $SEQ, $D_MODEL);
 
-    // Now backprop into weights:
-    // dWq = X^T @ dQ  [D, D]
+    // --- Weight gradients for QKV ---
     $backend->matmulTnDev($xGpu, $dQGpu, $dWqGpu, $D_MODEL, $SEQ, $D_MODEL);
-    // dWk = X^T @ dK
     $backend->matmulTnDev($xGpu, $dKGpu, $dWkGpu, $D_MODEL, $SEQ, $D_MODEL);
-    // dWv = X^T @ dV
     $backend->matmulTnDev($xGpu, $dVGpu, $dWvGpu, $D_MODEL, $SEQ, $D_MODEL);
-    // dWo = ... (we skip the output projection for v1)
 
-    // dX contribution from attention:
-    // dX_attn = dQ @ Wq^T + dK @ Wk^T + dV @ Wv^T
-    // Then add dX through residual from dY1.
-    // (Residual contributes identity: dX += dO = dY1.)
-    // Skip the full dX chain for v1 — we still update all weights because
-    // they have their own dW computed.
-
-    // ---- SGD updates ----
-    $backend->sgdUpdateDev($wqGpu, $dWqGpu, $LR, $D_MODEL * $D_MODEL);
-    $backend->sgdUpdateDev($wkGpu, $dWkGpu, $LR, $D_MODEL * $D_MODEL);
-    $backend->sgdUpdateDev($wvGpu, $dWvGpu, $LR, $D_MODEL * $D_MODEL);
-    $backend->sgdUpdateDev($w1Gpu, $dW1Gpu, $LR, $D_MODEL * $D_FF);
-    $backend->sgdUpdateDev($b1Gpu, $db1Gpu, $LR, $D_FF);
-    $backend->sgdUpdateDev($w2Gpu, $dW2Gpu, $LR, $D_FF * $D_MODEL);
-    $backend->sgdUpdateDev($b2Gpu, $db2Gpu, $LR, $D_MODEL);
+    // ================================================================
+    // SGD UPDATES
+    // ================================================================
+    $backend->sgdUpdateDev($wqGpu,  $dWqGpu,  $LR, $D_MODEL * $D_MODEL);
+    $backend->sgdUpdateDev($wkGpu,  $dWkGpu,  $LR, $D_MODEL * $D_MODEL);
+    $backend->sgdUpdateDev($wvGpu,  $dWvGpu,  $LR, $D_MODEL * $D_MODEL);
+    $backend->sgdUpdateDev($w1Gpu,  $dW1Gpu,  $LR, $D_MODEL * $D_FF);
+    $backend->sgdUpdateDev($b1Gpu,  $db1Gpu,  $LR, $D_FF);
+    $backend->sgdUpdateDev($w2Gpu,  $dW2Gpu,  $LR, $D_FF * $D_MODEL);
+    $backend->sgdUpdateDev($b2Gpu,  $db2Gpu,  $LR, $D_MODEL);
     $backend->sgdUpdateDev($wlmGpu, $dWlmGpu, $LR, $D_MODEL * $vocabSize);
     $backend->sgdUpdateDev($blmGpu, $dblmGpu, $LR, $vocabSize);
 
@@ -385,5 +372,5 @@ for ($step = 0; $step < $STEPS; $step++) {
 $totalTime = microtime(true) - $tStart;
 
 echo str_repeat('=', 60) . "\n";
-printf("Total:   %.1f s\n", $totalTime);
+printf("Total:    %.1f s\n", $totalTime);
 printf("Per step: %.4f s\n", $totalTime / $STEPS);
