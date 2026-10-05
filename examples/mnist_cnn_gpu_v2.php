@@ -253,14 +253,15 @@ for ($epoch = 0; $epoch < $EPOCHS; $epoch++) {
             $BATCH, IN_C, IN_H, IN_W, C1, C1_H, C1_W, K, K, 1, PAD
         );
 
-        // ---- SGD (average over batch) ----
-        $lrEff = $LR / $nReal;
-        $backend->sgdUpdateDev($w1Gpu, $dw1Gpu, $lrEff, $SZ_W1);
-        $backend->sgdUpdateDev($b1Gpu, $db1Gpu, $lrEff, C1);
-        $backend->sgdUpdateDev($w2Gpu, $dw2Gpu, $lrEff, $SZ_W2);
-        $backend->sgdUpdateDev($b2Gpu, $db2Gpu, $lrEff, C2);
-        $backend->sgdUpdateDev($w3Gpu, $dw3Gpu, $lrEff, $SZ_W3);
-        $backend->sgdUpdateDev($b3Gpu, $db3Gpu, $lrEff, N_CLS);
+        // ---- SGD ----
+        // softmaxCeDev already divides dLogits by BATCH, so dW is
+        // the average gradient over the batch. Use LR directly.
+        $backend->sgdUpdateDev($w1Gpu, $dw1Gpu, $LR, $SZ_W1);
+        $backend->sgdUpdateDev($b1Gpu, $db1Gpu, $LR, C1);
+        $backend->sgdUpdateDev($w2Gpu, $dw2Gpu, $LR, $SZ_W2);
+        $backend->sgdUpdateDev($b2Gpu, $db2Gpu, $LR, C2);
+        $backend->sgdUpdateDev($w3Gpu, $dw3Gpu, $LR, $SZ_W3);
+        $backend->sgdUpdateDev($b3Gpu, $db3Gpu, $LR, N_CLS);
     }
 
     $backend->sync();
