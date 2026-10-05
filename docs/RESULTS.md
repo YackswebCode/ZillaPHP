@@ -140,3 +140,34 @@ MaxPool2D(2) → Conv2D(8→16) → ReLU → MaxPool2D(2) → FC(6400→10)`.
 **Interpretation:** the audio preprocessing (WAV → STFT → mel → log)
 and the batched CNN kernels work together correctly on 64-band × 101-frame
 spectrograms. This validates the pipeline for real speech datasets.
+
+### 8.7 GPU Transformer Training — First Result
+
+**Architecture:** single-head char-level Transformer, dim=64, 1 layer,
+FFN hidden=128, seq=32, vocab=59.
+
+**Training:** 50,000 characters of Shakespeare, SGD lr=0.02, 3000 steps.
+
+**Environment:** NVIDIA Tesla T4 (Colab free tier), CUDA 13.0, cuBLAS,
+cuFFT, PHP 8.4.25.
+
+| Metric | Value |
+|:---|---:|
+| Initial loss (step 25) | 4.0787 |
+| Final loss (step 3000) | **2.7900** |
+| Loss reduction | **31.6%** |
+| Total training time | **5.4 s** |
+| Per step | **1.8 ms** |
+| Throughput | **~555 steps/s** |
+| CPU reference (full pipeline, this repo) | 1.27 s/step |
+
+**Interpretation:** This is (to the authors' knowledge) the first
+demonstration of a Transformer language model trained end-to-end
+using a PHP-native framework with GPU acceleration. Every operation
+in the training loop — matrix multiplication, attention,
+causal softmax, cross-entropy loss, and parameter updates — executes
+on the GPU via cuBLAS, cuFFT, and custom CUDA kernels dispatched
+from PHP through FFI.
+
+**Not yet implemented (v2 roadmap):** LayerNorm, multi-head attention,
+embedding backward, stacked layers.
