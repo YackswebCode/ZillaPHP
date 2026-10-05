@@ -83,6 +83,10 @@ final class CudaBackend extends CpuBackend
                 int conv2d_bwd_dev(int input_id, int weight_id, int gradOut_id, int gradInput_id, int gradWeight_id, int gradBias_id, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
                 int maxpool2d_fwd_dev(int input_id, int output_id, int argmax_id, int C, int H, int W, int outH, int outW, int kH, int kW, int stride);
                 int maxpool2d_bwd_dev(int gradOut_id, int argmax_id, int gradInput_id, int C, int outH, int outW);
+                int conv2d_batched_fwd_dev(int input_id, int weight_id, int bias_id, int output_id, int B, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
+                int conv2d_batched_bwd_dev(int input_id, int weight_id, int gradOut_id, int gradInput_id, int gradWeight_id, int gradBias_id, int B, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
+                int maxpool2d_batched_fwd_dev(int input_id, int output_id, int argmax_id, int B, int C, int H, int W, int outH, int outW, int kH, int kW, int stride);
+                int maxpool2d_batched_bwd_dev(int gradOut_id, int argmax_id, int gradInput_id, int B, int C, int outH, int outW);
                 C,
                 $this->libraryPath
             );
@@ -668,6 +672,71 @@ final class CudaBackend extends CpuBackend
             $C, $outH, $outW
         ) !== 0) {
             throw new \RuntimeException("maxpool2d_bwd_dev failed.");
+        }
+    }
+
+        // ==================================================================
+    // Batched Conv2D / MaxPool2D
+    // ==================================================================
+
+    public function conv2dBatchedFwdDev(
+        int $inputId, int $weightId, int $biasId, int $outputId,
+        int $B, int $C, int $H, int $W,
+        int $outC, int $outH, int $outW,
+        int $kH, int $kW,
+        int $stride, int $padding,
+    ): void {
+        if ($this->ffi->conv2d_batched_fwd_dev(
+            $inputId, $weightId, $biasId, $outputId,
+            $B, $C, $H, $W, $outC, $outH, $outW,
+            $kH, $kW, $stride, $padding
+        ) !== 0) {
+            throw new \RuntimeException("conv2d_batched_fwd_dev failed.");
+        }
+    }
+
+    public function conv2dBatchedBwdDev(
+        int $inputId, int $weightId, int $gradOutId,
+        int $gradInputId, int $gradWeightId, int $gradBiasId,
+        int $B, int $C, int $H, int $W,
+        int $outC, int $outH, int $outW,
+        int $kH, int $kW,
+        int $stride, int $padding,
+    ): void {
+        if ($this->ffi->conv2d_batched_bwd_dev(
+            $inputId, $weightId, $gradOutId,
+            $gradInputId, $gradWeightId, $gradBiasId,
+            $B, $C, $H, $W, $outC, $outH, $outW,
+            $kH, $kW, $stride, $padding
+        ) !== 0) {
+            throw new \RuntimeException("conv2d_batched_bwd_dev failed.");
+        }
+    }
+
+    public function maxPool2dBatchedFwdDev(
+        int $inputId, int $outputId, int $argmaxId,
+        int $B, int $C, int $H, int $W,
+        int $outH, int $outW,
+        int $kH, int $kW, int $stride,
+    ): void {
+        if ($this->ffi->maxpool2d_batched_fwd_dev(
+            $inputId, $outputId, $argmaxId,
+            $B, $C, $H, $W, $outH, $outW,
+            $kH, $kW, $stride
+        ) !== 0) {
+            throw new \RuntimeException("maxpool2d_batched_fwd_dev failed.");
+        }
+    }
+
+    public function maxPool2dBatchedBwdDev(
+        int $gradOutId, int $argmaxId, int $gradInputId,
+        int $B, int $C, int $outH, int $outW,
+    ): void {
+        if ($this->ffi->maxpool2d_batched_bwd_dev(
+            $gradOutId, $argmaxId, $gradInputId,
+            $B, $C, $outH, $outW
+        ) !== 0) {
+            throw new \RuntimeException("maxpool2d_batched_bwd_dev failed.");
         }
     }
 }
