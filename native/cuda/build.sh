@@ -28,6 +28,7 @@ nvcc -O3 -shared -Xcompiler -fPIC \
     buffer_registry.cu device_ops.cu training_ops.cu \
     conv2d.cu pooling.cu \
     conv2d_batched.cu pooling_batched.cu \
+    attention.cu \
     -lcudart -lcublas -lcufft
 
 echo "Built: $(pwd)/libzilla_cuda.so"

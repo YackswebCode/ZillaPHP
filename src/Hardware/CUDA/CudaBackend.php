@@ -87,6 +87,11 @@ final class CudaBackend extends CpuBackend
                 int conv2d_batched_bwd_dev(int input_id, int weight_id, int gradOut_id, int gradInput_id, int gradWeight_id, int gradBias_id, int B, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
                 int maxpool2d_batched_fwd_dev(int input_id, int output_id, int argmax_id, int B, int C, int H, int W, int outH, int outW, int kH, int kW, int stride);
                 int maxpool2d_batched_bwd_dev(int gradOut_id, int argmax_id, int gradInput_id, int B, int C, int outH, int outW);
+                int softmax_rows_fwd_dev(int x_id, int y_id, int N, int M);
+                int softmax_rows_bwd_dev(int P_id, int dP_id, int dS_id, int N, int M);
+                int causal_mask_dev(int x_id, int N, int M, float maskValue);
+                int scale_dev(int x_id, float s, int n);
+                int causal_softmax_dev(int x_id, int N, int M, float maskValue);
                 C,
                 $this->libraryPath
             );
@@ -738,5 +743,39 @@ final class CudaBackend extends CpuBackend
         ) !== 0) {
             throw new \RuntimeException("maxpool2d_batched_bwd_dev failed.");
         }
+    }
+
+        // ==================================================================
+    // Attention primitives
+    // ==================================================================
+
+    public function softmaxRowsFwdDev(int $xId, int $yId, int $N, int $M): void
+    {
+        if ($this->ffi->softmax_rows_fwd_dev($xId, $yId, $N, $M) !== 0)
+            throw new \RuntimeException("softmax_rows_fwd_dev failed.");
+    }
+
+    public function softmaxRowsBwdDev(int $pId, int $dpId, int $dsId, int $N, int $M): void
+    {
+        if ($this->ffi->softmax_rows_bwd_dev($pId, $dpId, $dsId, $N, $M) !== 0)
+            throw new \RuntimeException("softmax_rows_bwd_dev failed.");
+    }
+
+    public function causalMaskDev(int $xId, int $N, int $M, float $maskValue = -1e9): void
+    {
+        if ($this->ffi->causal_mask_dev($xId, $N, $M, $maskValue) !== 0)
+            throw new \RuntimeException("causal_mask_dev failed.");
+    }
+
+    public function scaleDev(int $xId, float $scale, int $n): void
+    {
+        if ($this->ffi->scale_dev($xId, $scale, $n) !== 0)
+            throw new \RuntimeException("scale_dev failed.");
+    }
+
+    public function causalSoftmaxDev(int $xId, int $N, int $M, float $maskValue = -1e9): void
+    {
+        if ($this->ffi->causal_softmax_dev($xId, $N, $M, $maskValue) !== 0)
+            throw new \RuntimeException("causal_softmax_dev failed.");
     }
 }
