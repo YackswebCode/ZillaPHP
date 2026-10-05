@@ -120,3 +120,23 @@ shift (−1.4 pp) is expected: batched SGD takes one update per batch
 instead of 64, so the effective number of parameter updates is lower
 for the same number of epochs.
 | 3.1 | 2026-10-05 | Added GPU CNN v1 (96.62% in 80 s) and v2 (95.21% in 16 s, 130× speedup) |
+### 8.6 Audio CNN — Synthetic Dataset (Pipeline Validation)
+
+**Purpose:** validate the audio feature pipeline and batched CNN on audio
+without requiring the 2.3 GB Speech Commands download.
+
+**Data:** 1,000 training + 200 test clips across 10 classes
+(8 sines at 200–3000 Hz, 1 sweep, 1 noise).
+
+**Architecture:** identical to the MNIST CNN — `Conv2D(1→8) → ReLU →
+MaxPool2D(2) → Conv2D(8→16) → ReLU → MaxPool2D(2) → FC(6400→10)`.
+
+| Metric | Value |
+|:---|---:|
+| Total training | 4.0 s |
+| Per epoch | 0.4 s |
+| Test accuracy | **100.00%** (200 / 200) |
+
+**Interpretation:** the audio preprocessing (WAV → STFT → mel → log)
+and the batched CNN kernels work together correctly on 64-band × 101-frame
+spectrograms. This validates the pipeline for real speech datasets.
