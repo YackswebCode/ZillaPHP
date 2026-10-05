@@ -100,3 +100,23 @@ iterations and plain SGD (no Adam), not to numerical issues.
 64 samples per batch, each requiring a full PHP → GPU → CPU round trip.
 A batched conv kernel (v2) would further reduce per-epoch time to
 ~3–5 s.
+
+### 8.5 GPU CNN — Batched Kernels (v2)
+
+**Architecture:** same as §8.4.
+**Change:** Conv2D and MaxPool2D now process all B=64 samples in a single
+GPU launch, instead of one sample at a time.
+
+| Metric | CPU CNN | GPU CNN v1 | **GPU CNN v2** | Speedup vs CPU |
+|:---|---:|---:|---:|---:|
+| Per epoch | ~420 s | 16 s | **3.2 s** | **~130×** |
+| Total (5 epochs) | ~35 min | 80 s | **16 s** | **~130×** |
+| Test accuracy | 98.13% | 96.62% | **95.21%** | — |
+
+**Interpretation:** The batched Conv2D/MaxPool2D kernels deliver a **5×
+improvement over the per-sample version** (16 s → 3.2 s per epoch) and
+**~130× over the CPU baseline** (420 s → 3.2 s per epoch). The accuracy
+shift (−1.4 pp) is expected: batched SGD takes one update per batch
+instead of 64, so the effective number of parameter updates is lower
+for the same number of epochs.
+| 3.1 | 2026-10-05 | Added GPU CNN v1 (96.62% in 80 s) and v2 (95.21% in 16 s, 130× speedup) |
