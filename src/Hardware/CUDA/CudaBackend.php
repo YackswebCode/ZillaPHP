@@ -79,6 +79,10 @@ final class CudaBackend extends CpuBackend
                 int  matmul_tn_dev(int a_id, int b_id, int c_id, int M, int K, int N);
                 int  matmul_nt_dev(int a_id, int b_id, int c_id, int M, int K, int N);
                 int  copy_dev(int src_id, int dst_id, int n);
+                int conv2d_fwd_dev(int input_id, int weight_id, int bias_id, int output_id, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
+                int conv2d_bwd_dev(int input_id, int weight_id, int gradOut_id, int gradInput_id, int gradWeight_id, int gradBias_id, int C, int H, int W, int outC, int outH, int outW, int kH, int kW, int stride, int padding);
+                int maxpool2d_fwd_dev(int input_id, int output_id, int argmax_id, int C, int H, int W, int outH, int outW, int kH, int kW, int stride);
+                int maxpool2d_bwd_dev(int gradOut_id, int argmax_id, int gradInput_id, int C, int outH, int outW);
                 C,
                 $this->libraryPath
             );
@@ -596,5 +600,74 @@ final class CudaBackend extends CpuBackend
     {
         if ($this->ffi->copy_dev($srcId, $dstId, $n) !== 0)
             throw new \RuntimeException("copy_dev failed.");
+    }
+
+        // ==================================================================
+    // Conv2D — device-side
+    // ==================================================================
+
+    public function conv2dFwdDev(
+        int $inputId, int $weightId, int $biasId, int $outputId,
+        int $C, int $H, int $W,
+        int $outC, int $outH, int $outW,
+        int $kH, int $kW,
+        int $stride, int $padding,
+    ): void {
+        if ($this->ffi->conv2d_fwd_dev(
+            $inputId, $weightId, $biasId, $outputId,
+            $C, $H, $W, $outC, $outH, $outW,
+            $kH, $kW, $stride, $padding
+        ) !== 0) {
+            throw new \RuntimeException("conv2d_fwd_dev failed.");
+        }
+    }
+
+    public function conv2dBwdDev(
+        int $inputId, int $weightId, int $gradOutId,
+        int $gradInputId, int $gradWeightId, int $gradBiasId,
+        int $C, int $H, int $W,
+        int $outC, int $outH, int $outW,
+        int $kH, int $kW,
+        int $stride, int $padding,
+    ): void {
+        if ($this->ffi->conv2d_bwd_dev(
+            $inputId, $weightId, $gradOutId,
+            $gradInputId, $gradWeightId, $gradBiasId,
+            $C, $H, $W, $outC, $outH, $outW,
+            $kH, $kW, $stride, $padding
+        ) !== 0) {
+            throw new \RuntimeException("conv2d_bwd_dev failed.");
+        }
+    }
+
+    // ==================================================================
+    // MaxPool2D — device-side
+    // ==================================================================
+
+    public function maxPool2dFwdDev(
+        int $inputId, int $outputId, int $argmaxId,
+        int $C, int $H, int $W,
+        int $outH, int $outW,
+        int $kH, int $kW, int $stride,
+    ): void {
+        if ($this->ffi->maxpool2d_fwd_dev(
+            $inputId, $outputId, $argmaxId,
+            $C, $H, $W, $outH, $outW,
+            $kH, $kW, $stride
+        ) !== 0) {
+            throw new \RuntimeException("maxpool2d_fwd_dev failed.");
+        }
+    }
+
+    public function maxPool2dBwdDev(
+        int $gradOutId, int $argmaxId, int $gradInputId,
+        int $C, int $outH, int $outW,
+    ): void {
+        if ($this->ffi->maxpool2d_bwd_dev(
+            $gradOutId, $argmaxId, $gradInputId,
+            $C, $outH, $outW
+        ) !== 0) {
+            throw new \RuntimeException("maxpool2d_bwd_dev failed.");
+        }
     }
 }
