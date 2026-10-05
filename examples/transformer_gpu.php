@@ -275,7 +275,7 @@ for ($step = 0; $step < $STEPS; $step++) {
     $backend->softmaxCeDev($logGpu, $yInGpu, $dLogGpu, $lossGpu, $SEQ, $vocabSize);
     $backend->sync();
 
-    $lossVal = $backend->bufferDownload($lossGpu, 1)[0];
+    $lossVal = $backend->bufferDownload($lossGpu, 1)[0] / $SEQ;
     $runningLoss += $lossVal;
 
     // dLogits → dW_lm, db_lm, dY2
